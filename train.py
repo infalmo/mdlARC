@@ -235,10 +235,12 @@ def run_inference(
         device=device,
         max_new_tokens=max_new_tokens,
     )
-    output_tokens = extract_output_tokens(generated.tolist())
+    full_sequence = generated.tolist()
+    output_tokens = extract_output_tokens(full_sequence)
     predicted_grid = tokens_to_grid(output_tokens)
 
     print(f"\nInference results for task {task_id} pair {pair_index}")
+    print("Generated raw (string):", tokens_to_string(full_sequence))
     print("Generated (string):", tokens_to_string(output_tokens))
     if predicted_grid:
         print("Decoded grid:")
@@ -316,12 +318,17 @@ def evaluate_dataset(
             device=device,
             max_new_tokens=max_new_tokens,
         )
-        output_tokens = extract_output_tokens(generated.tolist())
+        full_sequence = generated.tolist()
+        output_tokens = extract_output_tokens(full_sequence)
         predicted_grid = tokens_to_grid(output_tokens)
         reference_grid = sols[example.pair_index]
 
         # Optional: print generated sequence
         if log_eval_strings and logged < log_eval_limit:
+            print("[eval generated raw]",
+                  f"task={example.task_id}",
+                  f"pair={example.pair_index}")
+            print("str:", tokens_to_string(full_sequence))
             print("[eval generated]",
                   f"task={example.task_id}",
                   f"pair={example.pair_index}")
