@@ -224,11 +224,12 @@ def greedy_generate_batch(
     device: torch.device,
     max_new_tokens: int,
 ) -> Tuple[torch.LongTensor, ...]:
-    """Greedy batched generation using the model's KV cache.
+    """Greedy batched generation over multiple prompt sequences.
 
-    All prompt sequences in `prompt_tokens_batch` must have the same length.
-    This function mirrors `greedy_generate` but processes several sequences
-    in parallel, sharing work per decoding step.
+    This implementation decodes several sequences in parallel by repeatedly
+    running the full model forward pass on the current batch of prefixes.
+    It does not use the KV cache, but increases total tokens/sec by
+    processing multiple sequences per step.
     """
     model.eval()
     if not prompt_tokens_batch:
@@ -241,155 +242,65 @@ def greedy_generate_batch(
             f"example_ids has {len(example_ids)} entries."
         )
 
-    if max_new_tokens <= 0:
-        return tuple(tokens.clone().cpu() for tokens in prompt_tokens_batch)
-
-    # All prompts in a batch must share the same length so that we can
-    # reuse the cached prefix without padding artifacts.
-    lengths = [int(tokens.size(0)) for tokens in prompt_tokens_batch]
-    first_len = lengths[0]
-    if any(l != first_len for l in lengths):
-        raise ValueError(
-            "All prompt sequences in greedy_generate_batch must have the same length."
-        )
-
-    seq_len = first_len
-    if seq_len > model.config.max_seq_len:
-        raise ValueError(
-            f"Sequence length {seq_len} exceeds model capacity ({model.config.max_seq_len})."
-        )
-
-    # Stack prompts into a single tensor.
-    input_ids = torch.stack(
-        [tokens.to(device) for tokens in prompt_tokens_batch], dim=0
-    )  # [B, S]
-    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
-
-    # First pass: run the full prompts to build KV cache and get initial logits.
-    outputs = model.forward_generate(
-        input_ids=input_ids,
-        example_ids=example_ids_tensor,
-        past_key_values=None,
-    )
-    logits_init = outputs["logits"]  # [B, S, V]
-    past_key_values_active = outputs["past_key_values"]
-
-    # Initialize per-sequence generated buffers with the prompts.
-    generated = [
-        [int(t) for t in tokens.tolist()] for tokens in prompt_tokens_batch
-    ]
-
-    # Initialize 3D position state after consuming the prompts.
-    pos_states = []
+    # Initialize per-sequence token lists from the provided prompts.
+    generated: list[list[int]] = []
     for tokens in prompt_tokens_batch:
-        x, y, z = 0, 0, 1
-        prompt_list = tokens.tolist()
-        for idx, tok in enumerate(prompt_list):
-            _, (x, y, z) = _update_position_state(
-                x, y, z, int(tok), is_first=(idx == 0)
-            )
-        pos_states.append((x, y, z))
+        seq = [int(t) for t in tokens.tolist()]
+        generated.append(seq)
 
     finished = [False] * batch_size
-    total_lengths = list(lengths)
-    example_ids_list = list(example_ids)
+    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
 
-    # Active set of sequence indices (into the original batch) that are still generating.
-    active_indices = list(range(batch_size))
-    logits_inc: Optional[torch.Tensor] = None
-
-    for step in range(max_new_tokens):
-        if not active_indices:
+    for _ in range(max_new_tokens):
+        if all(finished):
             break
 
-        # For the first step, we use the logits from the prompt pass.
-        # After that, we use the logits from the previous incremental step.
-        use_init_logits = step == 0
+        lengths = [len(seq) for seq in generated]
+        max_len = max(lengths)
 
-        new_active_indices = []
-        keep_rows = []
-        tokens_step = []
-        positions_step_list = []
-        example_ids_step = []
+        input_ids = torch.full(
+            (batch_size, max_len),
+            END_TOKEN_ID,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.bool, device=device
+        )
 
-        for row_idx, orig_idx in enumerate(active_indices):
-            if finished[orig_idx]:
+        for i, seq in enumerate(generated):
+            seq_len = len(seq)
+            if seq_len == 0:
                 continue
-
-            if use_init_logits:
-                # logits_init is indexed by the original batch dimension.
-                lm_logits = logits_init[orig_idx, total_lengths[orig_idx] - 1, :]
-            else:
-                # logits_inc corresponds to the current active batch ordering.
-                lm_logits = logits_inc[row_idx, -1, :]
-
-            next_token_id = int(torch.argmax(lm_logits).item())
-            generated[orig_idx].append(next_token_id)
-
-            x, y, z = pos_states[orig_idx]
-            pos, (x_new, y_new, z_new) = _update_position_state(
-                x, y, z, next_token_id, is_first=False
+            input_ids[i, :seq_len] = torch.tensor(
+                seq, dtype=torch.long, device=device
             )
-            pos_states[orig_idx] = (x_new, y_new, z_new)
-            total_lengths[orig_idx] += 1
+            attention_mask[i, :seq_len] = True
 
-            # Decide whether this sequence is finished.
-            if (
-                next_token_id == END_TOKEN_ID
-                or total_lengths[orig_idx] >= model.config.max_seq_len
-            ):
-                finished[orig_idx] = True
-            else:
-                new_active_indices.append(orig_idx)
-                keep_rows.append(row_idx)
-                tokens_step.append(next_token_id)
-                positions_step_list.append(pos)
-                example_ids_step.append(example_ids_list[orig_idx])
-
-        if not new_active_indices:
-            break
-
-        # Prepare inputs for the incremental step (only for still-active sequences).
-        B_next = len(new_active_indices)
-        input_ids_step = torch.empty(
-            (B_next, 1), dtype=torch.long, device=device
+        outputs = model(
+            input_ids=input_ids,
+            example_ids=example_ids_tensor,
+            attention_mask=attention_mask,
         )
-        positions_step = torch.empty(
-            (B_next, 1, 3), dtype=torch.long, device=device
-        )
-        for i, (tok_id, pos) in enumerate(zip(tokens_step, positions_step_list)):
-            input_ids_step[i, 0] = tok_id
-            positions_step[i, 0, :] = torch.tensor(
-                [pos[0], pos[1], pos[2]], dtype=torch.long, device=device
-            )
-        example_ids_step_tensor = torch.tensor(
-            example_ids_step, dtype=torch.long, device=device
-        )
+        logits = outputs["logits"]  # [B, max_len, vocab]
 
-        # Prune KV cache to keep only rows corresponding to still-active sequences.
-        index_tensor = torch.tensor(keep_rows, dtype=torch.long, device=device)
-        pruned_kv = []
-        for key, value in past_key_values_active:
-            pruned_kv.append(
-                (
-                    key.index_select(0, index_tensor),
-                    value.index_select(0, index_tensor),
+        for i in range(batch_size):
+            if finished[i]:
+                continue
+            seq_len = lengths[i]
+            if seq_len == 0:
+                continue
+            next_token_logits = logits[i, seq_len - 1, :]
+            next_token_id = int(torch.argmax(next_token_logits).item())
+            generated[i].append(next_token_id)
+
+            if next_token_id == END_TOKEN_ID:
+                finished[i] = True
+            elif len(generated[i]) >= model.config.max_seq_len:
+                print(
+                    "Reached model max_seq_len during generation for one sequence; stopping it."
                 )
-            )
-        past_key_values_active = tuple(pruned_kv)
-
-        # Incremental forward for the new tokens.
-        outputs_inc = model.forward_generate(
-            input_ids=input_ids_step,
-            example_ids=example_ids_step_tensor,
-            past_key_values=past_key_values_active,
-            positions_3d=positions_step,
-        )
-        logits_inc = outputs_inc["logits"]
-        past_key_values_active = outputs_inc["past_key_values"]
-
-        # Update active indices for the next iteration.
-        active_indices = new_active_indices
+                finished[i] = True
 
     return tuple(
         torch.tensor(seq, dtype=torch.long).cpu() for seq in generated
@@ -561,66 +472,59 @@ def evaluate_dataset(
     # Process in batches for parallel decoding.
     for start in range(0, len(eval_examples), batch_size):
         batch = eval_examples[start : start + batch_size]
-        # Group this batch by prompt length so that each call to
-        # greedy_generate_batch sees sequences of equal length.
-        by_length: Dict[int, list] = {}
-        for example in batch:
-            length = int(example.tokens.size(0))
-            by_length.setdefault(length, []).append(example)
 
-        for group in by_length.values():
-            # Optional prompt logging before generation.
+        # Optional prompt logging before generation.
+        if log_eval_strings and logged < log_eval_limit:
+            for example in batch:
+                if logged >= log_eval_limit:
+                    break
+                print(
+                    "\n[eval prompt]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(example.tokens.tolist()))
+                logged += 1
+
+        prompt_tokens_batch = tuple(example.tokens for example in batch)
+        example_ids_batch = tuple(example.example_id for example in batch)
+        generated_batch = greedy_generate_batch(
+            model=model,
+            prompt_tokens_batch=prompt_tokens_batch,
+            example_ids=example_ids_batch,
+            device=device,
+            max_new_tokens=max_new_tokens,
+        )
+
+        for example, generated in zip(batch, generated_batch):
+            sols = solutions.get(example.task_id)
+            if not sols or example.pair_index >= len(sols):
+                continue
+
+            full_sequence = generated.tolist()
+            output_tokens = extract_output_tokens(full_sequence)
+            predicted_grid = tokens_to_grid(output_tokens)
+            reference_grid = sols[example.pair_index]
+
+            # Optional: print generated sequence
             if log_eval_strings and logged < log_eval_limit:
-                for example in group:
-                    if logged >= log_eval_limit:
-                        break
-                    print(
-                        "\n[eval prompt]",
-                        f"task={example.task_id}",
-                        f"pair={example.pair_index}",
-                    )
-                    print("str:", tokens_to_string(example.tokens.tolist()))
-                    logged += 1
+                print(
+                    "[eval generated raw]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(full_sequence))
+                print(
+                    "[eval generated]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(output_tokens))
+                logged += 1
 
-            prompt_tokens_batch = tuple(example.tokens for example in group)
-            example_ids_batch = tuple(example.example_id for example in group)
-            generated_batch = greedy_generate_batch(
-                model=model,
-                prompt_tokens_batch=prompt_tokens_batch,
-                example_ids=example_ids_batch,
-                device=device,
-                max_new_tokens=max_new_tokens,
-            )
-
-            for example, generated in zip(group, generated_batch):
-                sols = solutions.get(example.task_id)
-                if not sols or example.pair_index >= len(sols):
-                    continue
-
-                full_sequence = generated.tolist()
-                output_tokens = extract_output_tokens(full_sequence)
-                predicted_grid = tokens_to_grid(output_tokens)
-                reference_grid = sols[example.pair_index]
-
-                # Optional: print generated sequence
-                if log_eval_strings and logged < log_eval_limit:
-                    print(
-                        "[eval generated raw]",
-                        f"task={example.task_id}",
-                        f"pair={example.pair_index}",
-                    )
-                    print("str:", tokens_to_string(full_sequence))
-                    print(
-                        "[eval generated]",
-                        f"task={example.task_id}",
-                        f"pair={example.pair_index}",
-                    )
-                    print("str:", tokens_to_string(output_tokens))
-                    logged += 1
-
-                is_match = predicted_grid == reference_grid
-                total += 1
-                correct += int(is_match)
+            is_match = predicted_grid == reference_grid
+            total += 1
+            correct += int(is_match)
 
     if total == 0:
         print("No evaluable test pairs found; skipping eval.")
