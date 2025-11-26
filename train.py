@@ -188,9 +188,7 @@ def train_one_epoch(
     return step
 
 
-def _build_weight_decay_param_groups(
-    model: nn.Module, weight_decay: float
-) -> Any:
+def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> Any:
     """Split parameters so only non-attention Linear weights use weight decay."""
     decay_params = []
     no_decay_params = []
@@ -291,9 +289,7 @@ def greedy_generate(
             print("Reached model max_seq_len during generation; stopping.")
             break
 
-        pos, (x, y, z) = _update_position_state(
-            x, y, z, token_id, is_first=False
-        )
+        pos, (x, y, z) = _update_position_state(x, y, z, token_id, is_first=False)
         pos_tensor = torch.tensor([[list(pos)]], dtype=torch.long, device=device)
 
         outputs = model.forward_generate(
@@ -330,7 +326,9 @@ def run_inference(
         )
 
     if log_prompt:
-        print("\nInference prompt (string):", tokens_to_string(candidate.tokens.tolist()))
+        print(
+            "\nInference prompt (string):", tokens_to_string(candidate.tokens.tolist())
+        )
 
     generated = greedy_generate(
         model=model,
@@ -357,10 +355,14 @@ def run_inference(
         try:
             # Plot two grids: input (before separator) and generated output
             prompt_grids = split_grids_from_tokens(candidate.tokens.tolist())
-            gen_grids = split_grids_from_tokens([*candidate.tokens.tolist(), *output_tokens, END_TOKEN_ID])
+            gen_grids = split_grids_from_tokens(
+                [*candidate.tokens.tolist(), *output_tokens, END_TOKEN_ID]
+            )
             # Prefer showing exactly two: the input grid(s) first segment and the predicted output
             input_grid = prompt_grids[0] if prompt_grids else []
-            output_grid = gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
+            output_grid = (
+                gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
+            )
             to_plot = [input_grid, output_grid]
             plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
         except Exception as e:
@@ -410,9 +412,11 @@ def evaluate_dataset(
         # Prepare prompt and generate
         # Optional: print prompt before generation
         if log_eval_strings and logged < log_eval_limit:
-            print("\n[eval prompt]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
+            print(
+                "\n[eval prompt]",
+                f"task={example.task_id}",
+                f"pair={example.pair_index}",
+            )
             print("str:", tokens_to_string(example.tokens.tolist()))
 
         generated = greedy_generate(
@@ -429,13 +433,17 @@ def evaluate_dataset(
 
         # Optional: print generated sequence
         if log_eval_strings and logged < log_eval_limit:
-            print("[eval generated raw]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
+            print(
+                "[eval generated raw]",
+                f"task={example.task_id}",
+                f"pair={example.pair_index}",
+            )
             print("str:", tokens_to_string(full_sequence))
-            print("[eval generated]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
+            print(
+                "[eval generated]",
+                f"task={example.task_id}",
+                f"pair={example.pair_index}",
+            )
             print("str:", tokens_to_string(output_tokens))
             logged += 1
 
@@ -501,11 +509,7 @@ def infer_num_examples_from_checkpoint(
 def build_model_and_data(
     args: argparse.Namespace,
 ) -> Tuple[
-    TinyTransformer,
-    ARCExampleDataset,
-    torch.utils.data.DataLoader,
-    torch.device,
-    Path,
+    TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
     """Construct dataset, dataloader, and model for a given arg namespace.
 
@@ -590,6 +594,7 @@ def train_model(
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
     optimizer = AdamW(param_groups, lr=args.lr)
     step = 0
+    model = torch.compile(model)
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         step = train_one_epoch(
@@ -643,11 +648,7 @@ def run(args: argparse.Namespace) -> None:
             data_path=data_path,
         )
         evaluate_model(
-            args=args,
-            model=model,
-            dataset=dataset,
-            device=device,
-            data_path=data_path,
+            args=args, model=model, dataset=dataset, device=device, data_path=data_path
         )
     else:
         # Eval-only mode: if a specific task is provided, run single-example inference.
