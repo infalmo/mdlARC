@@ -5,15 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import (
-    IGNORE_INDEX,
-    MAX_SEQ_LEN,
-    VOCAB_SIZE,
-    START_TOKEN_ID,
-    NEXT_LINE_TOKEN_ID,
-    IO_SEPARATOR_TOKEN_ID,
-    END_TOKEN_ID,
-)
+from utils import IGNORE_INDEX, MAX_SEQ_LEN, VOCAB_SIZE, compute_positions_3d
 
 
 @dataclass
@@ -264,6 +256,7 @@ class TinyTransformer(nn.Module):
         example_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
+        positions_3d: Optional[torch.Tensor] = None,
     ) -> dict:
         batch_size, seq_len = input_ids.size()
         if seq_len > self.config.max_seq_len:
@@ -277,6 +270,9 @@ class TinyTransformer(nn.Module):
         else:
             attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
+        if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
+            raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
+
         if targets is None:
             targets = input_ids
 
@@ -286,8 +282,11 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
-        # Compute 3D positions per token based on token semantics.
-        pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+        # Compute or reuse 3D positions per token.
+        if positions_3d is None:
+            pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+        else:
+            pos_xyz = positions_3d.to(device=device, dtype=torch.long)
 
         causal_mask = self._build_causal_mask(seq_len, device)
 
@@ -332,6 +331,9 @@ class TinyTransformer(nn.Module):
                 f"Sequence length {seq_len} exceeds model capacity ({self.config.max_seq_len})."
             )
 
+        if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
+            raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
+
         device = input_ids.device
 
         token_embeds = self.token_embedding(input_ids)
@@ -342,13 +344,20 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
+        pos_xyz = (
+            positions_3d.to(device=device, dtype=torch.long)
+            if positions_3d is not None
+            else None
+        )
+
         # Initial prompt: no cache yet, compute 3D positions and use the
         # exact same masking behavior as the standard forward pass.
         if past_key_values is None:
             attention_mask = torch.ones_like(
                 input_ids, dtype=torch.bool, device=device
             )
-            pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+            if pos_xyz is None:
+                pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
             causal_mask = self._build_causal_mask(seq_len, device)
 
             past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
@@ -366,7 +375,7 @@ class TinyTransformer(nn.Module):
             logits = self.lm_head(hidden_states)
             return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
-        if positions_3d is None:
+        if pos_xyz is None:
             raise ValueError("positions_3d must be provided when using past_key_values.")
 
         if len(past_key_values) != len(self.blocks):
@@ -378,7 +387,7 @@ class TinyTransformer(nn.Module):
         past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for block, layer_past in zip(self.blocks, past_key_values):
             hidden_states, present_kv = block.forward_with_cache(
-                hidden_states, positions_3d, past_key_value=layer_past
+                hidden_states, pos_xyz, past_key_value=layer_past
             )
             past_key_values_out.append(present_kv)
 
@@ -390,69 +399,12 @@ class TinyTransformer(nn.Module):
     def _compute_positions_3d(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Map sequence tokens to 3D coordinates (x,y,z) per user spec.
-
-        Grid extents: x in [0, 29], y in [0, 30], z in {0..4}.
-        Mapping rules:
-          - <start> at (0,0,0)
-          - Input grid in z=1 layer; rows along y, columns along x; <next_line> occupies a cell
-          - <input_output_separator> at (0,0,2)
-          - Output grid in z=3 layer; same layout as input
-          - <end> at (0,0,4)
-        """
-        B, S = input_ids.shape
-        device = input_ids.device
-        pos = torch.zeros((B, S, 3), dtype=torch.long, device=device)
-
-        # Iterate per batch element to respect per-sequence semantics
-        for b in range(B):
-            x = 0
-            y = 0
-            z = 1  # start in input layer after <start>
-            seen_sep = False
-            for t in range(S):
-                if not attention_mask[b, t]:
-                    # beyond real tokens; leave zeros
-                    continue
-                tok = int(input_ids[b, t].item())
-                if t == 0 and tok == START_TOKEN_ID:
-                    pos[b, t, 0] = 0
-                    pos[b, t, 1] = 0
-                    pos[b, t, 2] = 0
-                    # Do not change grid counters
-                    continue
-
-                if tok == IO_SEPARATOR_TOKEN_ID:
-                    pos[b, t, 0] = 0
-                    pos[b, t, 1] = 0
-                    pos[b, t, 2] = 2
-                    # Switch to output grid after separator
-                    x, y = 0, 0
-                    z = 3
-                    seen_sep = True
-                    continue
-
-                if tok == END_TOKEN_ID:
-                    pos[b, t, 0] = 0
-                    pos[b, t, 1] = 0
-                    pos[b, t, 2] = 4
-                    continue
-
-                # Regular grid tokens (digits 0-9 and <next_line>)
-                # Clamp to grid bounds (30x31) defensively
-                px = min(max(x, 0), 29)
-                py = min(max(y, 0), 30)
-                pos[b, t, 0] = px
-                pos[b, t, 1] = py
-                pos[b, t, 2] = z
-
-                if tok == NEXT_LINE_TOKEN_ID:
-                    x = 0
-                    y += 1
-                else:
-                    x += 1
-
-        return pos
+        """Compute 3D positions on CPU, then move them to the target device."""
+        pos_cpu = compute_positions_3d(
+            input_ids=input_ids.detach().cpu(),
+            attention_mask=attention_mask.detach().cpu(),
+        )
+        return pos_cpu.to(device=input_ids.device, dtype=torch.long)
 
 
 class RotaryEmbedding3D(nn.Module):

@@ -30,7 +30,7 @@ NEXT_LINE_TOKEN_ID = TOKEN_TO_ID["<next_line>"]
 IO_SEPARATOR_TOKEN_ID = TOKEN_TO_ID["<input_output_separator>"]
 END_TOKEN_ID = TOKEN_TO_ID["<end>"]
 
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1863
 IGNORE_INDEX = -100
 
 
@@ -117,6 +117,70 @@ def tokens_to_string(tokens: Sequence[int]) -> str:
     for tok in tokens:
         parts.append(ID_TO_TOKEN.get(int(tok), str(int(tok))))
     return " ".join(parts)
+
+
+def compute_positions_3d(
+    input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Compute per-token 3D grid coordinates on CPU.
+
+    Expects 2D input tensors shaped [batch, seq_len]; padding should be
+    indicated via `attention_mask`.
+    """
+    if input_ids.dim() != 2:
+        raise ValueError("input_ids must have shape [batch, seq_len].")
+
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    else:
+        attention_mask = attention_mask.to(dtype=torch.bool, device=input_ids.device)
+
+    ids_cpu = input_ids.detach().cpu()
+    mask_cpu = attention_mask.detach().cpu()
+    B, S = ids_cpu.shape
+    pos = torch.zeros((B, S, 3), dtype=torch.long)
+
+    for b in range(B):
+        x = 0
+        y = 0
+        z = 1
+        for t in range(S):
+            if not mask_cpu[b, t]:
+                continue
+            tok = int(ids_cpu[b, t].item())
+            if t == 0 and tok == START_TOKEN_ID:
+                pos[b, t, 0] = 0
+                pos[b, t, 1] = 0
+                pos[b, t, 2] = 0
+                continue
+
+            if tok == IO_SEPARATOR_TOKEN_ID:
+                pos[b, t, 0] = 0
+                pos[b, t, 1] = 0
+                pos[b, t, 2] = 2
+                x, y = 0, 0
+                z = 3
+                continue
+
+            if tok == END_TOKEN_ID:
+                pos[b, t, 0] = 0
+                pos[b, t, 1] = 0
+                pos[b, t, 2] = 4
+                continue
+
+            px = min(max(x, 0), 29)
+            py = min(max(y, 0), 30)
+            pos[b, t, 0] = px
+            pos[b, t, 1] = py
+            pos[b, t, 2] = z
+
+            if tok == NEXT_LINE_TOKEN_ID:
+                x = 0
+                y += 1
+            else:
+                x += 1
+
+    return pos
 
 
 def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
@@ -335,10 +399,13 @@ def collate_examples(
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
 
+    positions_3d = compute_positions_3d(input_ids, attention_mask)
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "example_ids": example_ids,
+        "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],
         "splits": [example.split for example in batch],
         "has_output": [example.has_output for example in batch],

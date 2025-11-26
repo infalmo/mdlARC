@@ -21,6 +21,7 @@ from utils import (
     tokens_to_grid,
     split_grids_from_tokens,
     plot_grids,
+    compute_positions_3d,
 )
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
@@ -141,8 +142,14 @@ def train_one_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
 
-        outputs = model(input_ids, example_ids, attention_mask=attention_mask)
+        outputs = model(
+            input_ids,
+            example_ids,
+            attention_mask=attention_mask,
+            positions_3d=positions_3d,
+        )
         loss = outputs["loss"]
 
         optimizer.zero_grad()
@@ -249,8 +256,13 @@ def greedy_generate(
     max_new_tokens: int,
 ) -> torch.LongTensor:
     model.eval()
-    generated = prompt_tokens.unsqueeze(0).to(device)
+    prompt = prompt_tokens.unsqueeze(0)
+    prompt_attention = torch.ones_like(prompt, dtype=torch.bool)
+    prompt_positions = compute_positions_3d(prompt, prompt_attention)
+
+    generated = prompt.to(device)
     example_ids_tensor = torch.tensor([example_id], dtype=torch.long, device=device)
+    prompt_positions = prompt_positions.to(device)
 
     # Initialize 3D position state after consuming the prompt.
     x, y, z = 0, 0, 1
@@ -263,6 +275,7 @@ def greedy_generate(
         input_ids=generated,
         example_ids=example_ids_tensor,
         past_key_values=None,
+        positions_3d=prompt_positions,
     )
     logits = outputs["logits"]
     past_key_values = outputs["past_key_values"]
