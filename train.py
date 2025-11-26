@@ -24,6 +24,8 @@ from utils import (
     compute_positions_3d,
 )
 
+torch.set_float32_matmul_precision("high")
+
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
 
