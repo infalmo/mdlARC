@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import numpy as np
 
 try:
@@ -282,6 +282,7 @@ class SequenceExample:
     split: str
     pair_index: int
     has_output: bool
+    seq_len: int
 
 
 class ARCExampleDataset(Dataset):
@@ -321,6 +322,7 @@ class ARCExampleDataset(Dataset):
         self.task_id_to_example_id: Dict[str, int] = {}
         self.indices_by_split: Dict[str, List[int]] = {split: [] for split in splits}
         self.task_ids = task_ids
+        self.sequence_lengths: List[int] = []
 
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
@@ -345,6 +347,7 @@ class ARCExampleDataset(Dataset):
                             f"for task {task_id} ({split} pair {pair_index})."
                         )
                     tensor = torch.tensor(tokens, dtype=torch.long)
+                    seq_len = len(tokens)
                     example = SequenceExample(
                         tokens=tensor,
                         example_id=example_id,
@@ -352,11 +355,13 @@ class ARCExampleDataset(Dataset):
                         split=split,
                         pair_index=pair_index,
                         has_output=has_output,
+                        seq_len=seq_len,
                     )
                     self.indices_by_split.setdefault(split, []).append(
                         len(self.examples)
                     )
                     self.examples.append(example)
+                    self.sequence_lengths.append(seq_len)
 
         self.num_examples = len(self.task_id_to_example_id)
 
@@ -394,6 +399,68 @@ class ARCExampleDataset(Dataset):
             yield example
 
 
+class LengthBucketBatchSampler(Sampler[List[int]]):
+    """Group indices with similar sequence lengths to limit padding within a batch."""
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        shuffle: bool = True,
+        bucket_size: Optional[int] = None,
+        drop_last: bool = False,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        # Bucket size controls how tightly we cluster similar lengths before batching.
+        bucket_size = bucket_size or batch_size * 4
+        self.bucket_size = max(bucket_size, batch_size)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        if not self.lengths:
+            return iter(())
+
+        if self.shuffle:
+            indices = torch.randperm(len(self.lengths)).tolist()
+        else:
+            indices = sorted(
+                range(len(self.lengths)),
+                key=lambda idx: self.lengths[idx],
+                reverse=True,
+            )
+
+        batches: List[List[int]] = []
+        if self.shuffle:
+            # Within each bucket, sort by length so batches group similar sequence sizes.
+            for start in range(0, len(indices), self.bucket_size):
+                bucket = indices[start : start + self.bucket_size]
+                bucket.sort(key=lambda idx: self.lengths[idx], reverse=True)
+                for bucket_start in range(0, len(bucket), self.batch_size):
+                    batch = bucket[bucket_start : bucket_start + self.batch_size]
+                    if len(batch) == self.batch_size or not self.drop_last:
+                        batches.append(batch)
+            if len(batches) > 1:
+                order = torch.randperm(len(batches)).tolist()
+                batches = [batches[i] for i in order]
+        else:
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+
+        return iter(batches)
+
+
 def collate_examples(
     batch: List[SequenceExample], pad_token_id: int = END_TOKEN_ID
 ) -> Dict[str, torch.Tensor]:
@@ -401,7 +468,7 @@ def collate_examples(
         raise ValueError("Empty batch encountered during collation.")
 
     batch_size = len(batch)
-    max_len = max(example.tokens.size(0) for example in batch)
+    max_len = max(example.seq_len for example in batch)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
@@ -409,7 +476,7 @@ def collate_examples(
     positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
     for idx, example in enumerate(batch):
-        seq_len = example.tokens.size(0)
+        seq_len = example.seq_len
         input_ids[idx, :seq_len] = example.tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
@@ -433,11 +500,22 @@ def create_dataloader(
     batch_size: int,
     shuffle: bool = True,
     num_workers: int = 0,
+    bucket_size_multiplier: int = 4,
 ) -> DataLoader:
-    return DataLoader(
-        dataset,
+    lengths = getattr(dataset, "sequence_lengths", None)
+    if lengths is None:
+        lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
+
+    bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
+    batch_sampler = LengthBucketBatchSampler(
+        lengths=lengths,
         batch_size=batch_size,
         shuffle=shuffle,
+        bucket_size=bucket_size,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_examples,
     )
