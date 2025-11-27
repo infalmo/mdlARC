@@ -1,11 +1,13 @@
 import argparse
 from dataclasses import asdict
+import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.optim import AdamW
+import numpy as np
 
 from tinytransformer import TinyTransformer, TinyTransformerConfig
 from utils import (
@@ -24,7 +26,10 @@ from utils import (
     compute_positions_3d,
 )
 
-torch.set_float32_matmul_precision("high")
+# Prefer TF32 on capable CUDA hardware (new API replaces allow_tf32 flags).
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.fp32_precision = "high"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
@@ -122,6 +127,51 @@ def resolve_device(device_str: str) -> torch.device:
         print("MPS not available, falling back to CPU.")
         return torch.device("cpu")
     return torch.device("cpu" if device_str not in {"cpu"} else "cpu")
+
+
+def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
+    """Capture Python/numpy/torch RNG states so training can resume deterministically."""
+    state: Dict[str, Any] = {"python": random.getstate(), "numpy": np.random.get_state()}
+    state["torch"] = torch.get_rng_state()
+    if torch.cuda.is_available() and device.type == "cuda":
+        try:
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    if hasattr(torch, "mps") and torch.backends.mps.is_available() and device.type == "mps":
+        try:
+            state["mps"] = torch.mps.get_rng_state()
+        except Exception:
+            pass
+    return state
+
+
+def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) -> None:
+    """Restore RNG state saved in a checkpoint; safe to call with None."""
+    if not state:
+        return
+    try:
+        random.setstate(state["python"])
+    except Exception:
+        pass
+    try:
+        np.random.set_state(state["numpy"])
+    except Exception:
+        pass
+    try:
+        torch.set_rng_state(state["torch"])
+    except Exception:
+        pass
+    if "cuda" in state and torch.cuda.is_available() and device.type == "cuda":
+        try:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        except Exception:
+            pass
+    if "mps" in state and hasattr(torch, "mps") and torch.backends.mps.is_available() and device.type == "mps":
+        try:
+            torch.mps.set_rng_state(state["mps"])
+        except Exception:
+            pass
 
 
 def train_one_epoch(
@@ -468,6 +518,7 @@ def maybe_save_model(
     save_path: Optional[Path],
     optimizer: Optional[torch.optim.Optimizer] = None,
     global_step: Optional[int] = None,
+    rng_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     if save_path is None:
         return
@@ -482,6 +533,8 @@ def maybe_save_model(
         checkpoint["optimizer_state"] = optimizer.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
+    if rng_state is not None:
+        checkpoint["rng_state"] = rng_state
     torch.save(checkpoint, save_path)
     print(f"Saved checkpoint to {save_path}")
 
@@ -528,6 +581,9 @@ def build_model_and_data(
     set_seed(args.seed)
     device = resolve_device(args.device)
     checkpoint = checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
+    # Restore RNG so data shuffling / dropout continue seamlessly after resuming.
+    if checkpoint:
+        _restore_rng_state(checkpoint.get("rng_state"), device)
 
     data_path = args.data_path
     if data_path is None:
@@ -644,6 +700,7 @@ def train_model(
         )
         if args.max_steps and step >= args.max_steps:
             break
+    rng_state = _capture_rng_state(device)
     maybe_save_model(
         model,
         dataset,
@@ -651,6 +708,7 @@ def train_model(
         args.save_path,
         optimizer=optimizer,
         global_step=step,
+        rng_state=rng_state,
     )
 
 
