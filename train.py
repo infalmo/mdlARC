@@ -28,11 +28,8 @@ from utils import (
 
 # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
 if torch.cuda.is_available():
-    torch.backends.fp32_precision = "tf32"
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
-    torch.backends.cudnn.rnn.fp32_precision = "tf32"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
