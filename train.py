@@ -296,8 +296,8 @@ def _update_position_state(
     if token_id == END_TOKEN_ID:
         return (0, 0, 4), (x, y, z)
 
-    px = min(max(x, 0), 29)
-    py = min(max(y, 0), 30)
+    px = min(max(x, 0), 30)
+    py = min(max(y, 0), 29)
     pos = (px, py, z)
 
     if token_id == NEXT_LINE_TOKEN_ID:
@@ -594,9 +594,6 @@ def build_model_and_data(
     checkpoint = (
         checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
     )
-    # Restore RNG so data shuffling / dropout continue seamlessly after resuming.
-    if checkpoint:
-        _restore_rng_state(checkpoint.get("rng_state"), device)
 
     data_path = args.data_path
     if data_path is None:
@@ -656,6 +653,7 @@ def build_model_and_data(
     if checkpoint:
         state_dict = checkpoint["model_state"]
         model.load_state_dict(state_dict, strict=False)
+        _restore_rng_state(checkpoint.get("rng_state"), device)
     # Stash checkpoint for downstream consumers (e.g., optimizer restore).
     model._loaded_checkpoint = checkpoint
 
