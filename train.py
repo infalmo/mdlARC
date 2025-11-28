@@ -695,7 +695,7 @@ def train_model(
         )
         return
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         step = train_one_epoch(
