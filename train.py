@@ -3,6 +3,7 @@ from dataclasses import asdict
 import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import time
 
 import torch
 from torch import nn
@@ -334,6 +335,7 @@ def greedy_generate(
     example_id: int,
     device: torch.device,
     cached_positions: Optional[torch.LongTensor] = None,
+    log_time: bool = False,
 ) -> torch.LongTensor:
     model.eval()
     prompt = prompt_tokens.unsqueeze(0)
@@ -368,6 +370,8 @@ def greedy_generate(
     logits = outputs["logits"]
     past_key_values = outputs["past_key_values"]
 
+    start_time = time.perf_counter() if log_time else None
+
     for _ in range(MAX_NEW_TOKENS):
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         token_id = int(next_token.item())
@@ -391,6 +395,14 @@ def greedy_generate(
         )
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
+
+    if log_time and start_time is not None:
+        elapsed = time.perf_counter() - start_time
+        new_tokens = seq_len - len(prompt_tokens)
+        print(
+            f"Generation time: {elapsed:.3f}s for {new_tokens} new tokens "
+            f"(total length {seq_len})"
+        )
 
     return torch.tensor(generated_tokens, dtype=torch.long)
 
@@ -426,6 +438,7 @@ def run_inference(
         cached_positions=candidate.cached_positions,
         example_id=candidate.example_id,
         device=device,
+        log_time=True,
     )
     full_sequence = generated.tolist()
     output_tokens = extract_output_tokens(full_sequence)
