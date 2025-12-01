@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from utils import (
     START_TOKEN_ID,
     compute_positions_3d,
     extract_output_tokens,
+    grid_to_tokens,
     plot_grids,
     split_grids_from_tokens,
     tokens_to_grid,
@@ -254,7 +256,9 @@ def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
 
 
 def _prepare_examples_for_inference(
-    examples: Sequence[object], include_targets: bool = False
+    examples: Sequence[object],
+    include_targets: bool = False,
+    solutions: Optional[Dict[Tuple[str, str, int], List[List[int]]]] = None,
 ) -> Tuple[
     List[List[int]],
     List[int],
@@ -284,6 +288,14 @@ def _prepare_examples_for_inference(
         targets: List[int] = []
         if include_targets and getattr(ex, "has_output", False):
             targets = extract_output_tokens(tokens)
+        elif include_targets and solutions is not None:
+            key = (
+                getattr(ex, "task_id", None),
+                getattr(ex, "split", None),
+                getattr(ex, "pair_index", None),
+            )
+            if key in solutions and solutions[key] is not None:
+                targets = grid_to_tokens(solutions[key])
         target_tokens.append(targets)
         metadata.append(
             {
@@ -360,6 +372,7 @@ def _select_inference_examples(
     split: str = "test",
     pair_index: Optional[int] = 0,
     require_outputs: bool = False,
+    solutions: Optional[Dict[Tuple[str, str, int], List[List[int]]]] = None,
 ) -> Tuple[
     List[List[int]],
     List[int],
@@ -375,7 +388,11 @@ def _select_inference_examples(
                 continue
             if pair_index is not None and example.pair_index != pair_index:
                 continue
-            if require_outputs and not example.has_output:
+            has_solution = (
+                solutions is not None
+                and (example.task_id, example.split, example.pair_index) in solutions
+            )
+            if require_outputs and not example.has_output and not has_solution:
                 continue
             candidate = example
             break
@@ -385,8 +402,8 @@ def _select_inference_examples(
             )
         selected.append(candidate)
 
-    prompts, example_ids, metadata, cached_positions, targets = (
-        _prepare_examples_for_inference(selected, include_targets=require_outputs)
+    prompts, example_ids, metadata, cached_positions, targets = _prepare_examples_for_inference(
+        selected, include_targets=require_outputs, solutions=solutions
     )
     return prompts, example_ids, metadata, cached_positions, targets
 
@@ -403,6 +420,7 @@ def run_batched_inference(
     log_prompts: bool = False,
     include_targets: bool = False,
 ) -> List[Dict[str, object]]:
+    solutions = _load_solutions_for_dataset(dataset, splits=[split]) if include_targets else None
     (
         prompts,
         example_ids,
@@ -415,6 +433,7 @@ def run_batched_inference(
         split=split,
         pair_index=pair_index,
         require_outputs=include_targets,
+        solutions=solutions,
     )
     if log_prompts:
         for meta, prompt in zip(metadata, prompts):
@@ -444,12 +463,38 @@ def run_batched_inference(
     )
 
 
+def _load_solutions_for_dataset(
+    dataset, splits: Sequence[str]
+) -> Dict[Tuple[str, str, int], List[List[int]]]:
+    """Load solutions.json located next to the dataset (used only for evaluation)."""
+    solutions_map: Dict[Tuple[str, str, int], List[List[int]]] = {}
+    source_path = getattr(dataset, "source_path", None)
+    if source_path is None:
+        return solutions_map
+    solutions_path = Path(source_path).with_name("solutions.json")
+    if not solutions_path.exists():
+        return solutions_map
+    try:
+        from utils import load_challenges
+
+        data = load_challenges(solutions_path)
+        for task_id, obj in data.items():
+            for split in splits:
+                for idx, pair in enumerate(obj.get(split, [])):
+                    if "output" in pair and pair["output"] is not None:
+                        solutions_map[(task_id, split, idx)] = pair["output"]
+    except Exception:
+        return solutions_map
+    return solutions_map
+
+
 def _gather_examples_for_split(
     dataset,
     split: str,
     task_ids: Optional[Sequence[str]] = None,
     pair_index: Optional[int] = None,
     require_outputs: bool = False,
+    solutions: Optional[Dict[Tuple[str, str, int], List[List[int]]]] = None,
 ):
     examples = []
     for example in dataset.iter_examples(split=split):
@@ -457,7 +502,11 @@ def _gather_examples_for_split(
             continue
         if pair_index is not None and example.pair_index != pair_index:
             continue
-        if require_outputs and not example.has_output:
+        has_solution = (
+            solutions is not None
+            and (example.task_id, example.split, example.pair_index) in solutions
+        )
+        if require_outputs and not example.has_output and not has_solution:
             continue
         examples.append(example)
     return examples
@@ -476,12 +525,14 @@ def run_split_inference(
     log_prompts: bool = False,
     include_targets: bool = True,
 ) -> List[Dict[str, object]]:
+    solutions = _load_solutions_for_dataset(dataset, splits=[split]) if include_targets else None
     examples = _gather_examples_for_split(
         dataset,
         split=split,
         task_ids=task_ids,
         pair_index=pair_index,
         require_outputs=include_targets,
+        solutions=solutions,
     )
     if not examples:
         return []
@@ -496,7 +547,7 @@ def run_split_inference(
             cached_positions,
             target_output_tokens,
         ) = _prepare_examples_for_inference(
-            batch_examples, include_targets=include_targets
+            batch_examples, include_targets=include_targets, solutions=solutions
         )
         if log_prompts:
             for meta, prompt in zip(metadata, prompts):
