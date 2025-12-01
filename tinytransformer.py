@@ -104,6 +104,11 @@ class MultiHeadSelfAttention(nn.Module):
         if pos_xyz is not None:
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(
+                device=queries.device, dtype=torch.bool
+            )
+
         # Incremental decoding branch: concatenate cached K/V and attend
         # from the new tokens only. No causal mask is needed because there
         # are no future positions beyond the newly appended tokens.
@@ -111,8 +116,19 @@ class MultiHeadSelfAttention(nn.Module):
             past_keys, past_values = past_key_value
             keys = torch.cat([past_keys, keys], dim=2)
             values = torch.cat([past_values, values], dim=2)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(
+                    device=keys.device, dtype=torch.bool
+                )
+                if attention_mask.dim() != 2 or attention_mask.size(1) != keys.size(2):
+                    raise ValueError(
+                        "attention_mask must have shape [batch, total_seq_len] when using KV cache."
+                    )
 
             attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+            if attention_mask is not None:
+                key_mask = ~attention_mask[:, None, None, :]
+                attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
             attn_weights = F.softmax(attn_scores, dim=-1)
             attn_weights = self.dropout(attn_weights)
             attn_output = torch.matmul(attn_weights, values)
@@ -215,7 +231,8 @@ class TransformerBlock(nn.Module):
         hidden_states = hidden_states + ff_output
 
         if attention_mask is not None:
-            hidden_states = hidden_states * attention_mask.unsqueeze(-1)
+            token_mask = attention_mask[:, -hidden_states.size(1) :]
+            hidden_states = hidden_states * token_mask.unsqueeze(-1)
         return hidden_states, present_key_value
 
 
@@ -316,6 +333,7 @@ class TinyTransformer(nn.Module):
         example_ids: torch.Tensor,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -323,7 +341,9 @@ class TinyTransformer(nn.Module):
         pass and the method returns per-layer key/value tensors that
         represent the entire prefix. When `past_key_values` is provided,
         `input_ids` and `positions_3d` should contain only the newly
-        generated tokens, and the cache is updated accordingly.
+        generated tokens, and the cache is updated accordingly. `attention_mask`
+        can be provided to mask padded tokens during the initial prompt pass,
+        and to mask cached keys during incremental decoding.
         """
         batch_size, seq_len = input_ids.size()
         if seq_len > self.config.max_seq_len:
@@ -335,6 +355,8 @@ class TinyTransformer(nn.Module):
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
 
         device = input_ids.device
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
         token_embeds = self.token_embedding(input_ids)
         example_embeds = self.example_embedding(example_ids)
@@ -353,9 +375,14 @@ class TinyTransformer(nn.Module):
         # Initial prompt: no cache yet, compute 3D positions and use the
         # exact same masking behavior as the standard forward pass.
         if past_key_values is None:
-            attention_mask = torch.ones_like(
-                input_ids, dtype=torch.bool, device=device
-            )
+            if attention_mask is None:
+                attention_mask = torch.ones_like(
+                    input_ids, dtype=torch.bool, device=device
+                )
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "When past_key_values is None, attention_mask must match input_ids shape."
+                )
             if pos_xyz is None:
                 pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
             causal_mask = self._build_causal_mask(seq_len, device)
@@ -378,6 +405,14 @@ class TinyTransformer(nn.Module):
         if pos_xyz is None:
             raise ValueError("positions_3d must be provided when using past_key_values.")
 
+        if attention_mask is not None:
+            past_seq_len = past_key_values[0][0].size(2)
+            expected_len = past_seq_len + seq_len
+            if attention_mask.shape != (batch_size, expected_len):
+                raise ValueError(
+                    "When using past_key_values, attention_mask must cover cached and current tokens."
+                )
+
         if len(past_key_values) != len(self.blocks):
             raise ValueError(
                 f"Expected {len(self.blocks)} past key/value pairs, "
@@ -387,7 +422,10 @@ class TinyTransformer(nn.Module):
         past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for block, layer_past in zip(self.blocks, past_key_values):
             hidden_states, present_kv = block.forward_with_cache(
-                hidden_states, pos_xyz, past_key_value=layer_past
+                hidden_states,
+                pos_xyz,
+                attention_mask=attention_mask,
+                past_key_value=layer_past,
             )
             past_key_values_out.append(present_kv)
 

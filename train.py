@@ -10,21 +10,17 @@ from torch import nn
 from torch.optim import AdamW
 import numpy as np
 
+from inference import greedy_generate, run_batched_inference
 from tinytransformer import TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
     END_TOKEN_ID,
-    IO_SEPARATOR_TOKEN_ID,
     MAX_SEQ_LEN,
-    NEXT_LINE_TOKEN_ID,
-    START_TOKEN_ID,
     create_dataloader,
-    extract_output_tokens,
     tokens_to_string,
     tokens_to_grid,
     split_grids_from_tokens,
     plot_grids,
-    compute_positions_3d,
 )
 
 # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
@@ -264,136 +260,6 @@ def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> A
     return param_groups
 
 
-def _update_position_state(
-    x: int, y: int, z: int, token_id: int, is_first: bool
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    """Update 3D grid position state for a single token.
-
-    Mirrors TinyTransformer._compute_positions_3d for sequential decoding.
-    """
-    if is_first and token_id == START_TOKEN_ID:
-        return (0, 0, 0), (x, y, z)
-
-    if token_id == IO_SEPARATOR_TOKEN_ID:
-        return (0, 0, 2), (0, 0, 3)
-
-    if token_id == END_TOKEN_ID:
-        return (0, 0, 4), (x, y, z)
-
-    px = min(max(x, 0), 30)
-    py = min(max(y, 0), 29)
-    pos = (px, py, z)
-
-    if token_id == NEXT_LINE_TOKEN_ID:
-        x = 0
-        y += 1
-    else:
-        x += 1
-
-    return pos, (x, y, z)
-
-
-def _derive_state_from_prompt_positions(
-    prompt_tokens: torch.LongTensor, prompt_positions: torch.LongTensor
-) -> Tuple[int, int, int]:
-    """Derive decoder state after consuming the prompt using cached positions."""
-    if prompt_tokens.numel() == 0:
-        return 0, 0, 1
-
-    last_token = int(prompt_tokens[-1].item())
-    last_pos = prompt_positions[-1]
-    x = int(last_pos[0].item())
-    y = int(last_pos[1].item())
-    z = int(last_pos[2].item())
-
-    if last_token == START_TOKEN_ID:
-        return 0, 0, 1
-    if last_token == IO_SEPARATOR_TOKEN_ID:
-        return 0, 0, 3
-    if last_token == END_TOKEN_ID:
-        return x, y, z
-    if last_token == NEXT_LINE_TOKEN_ID:
-        return 0, y + 1, z
-    return x + 1, y, z
-
-
-@torch.no_grad()
-def greedy_generate(
-    model: TinyTransformer,
-    prompt_tokens: torch.LongTensor,
-    example_id: int,
-    device: torch.device,
-    cached_positions: Optional[torch.LongTensor] = None,
-    log_time: bool = False,
-) -> torch.LongTensor:
-    model.eval()
-    prompt = prompt_tokens.unsqueeze(0)
-    prompt_attention = torch.ones_like(prompt, dtype=torch.bool)
-    if cached_positions is not None:
-        prompt_positions = cached_positions.unsqueeze(0)
-        x, y, z = _derive_state_from_prompt_positions(prompt_tokens, cached_positions)
-    else:
-        prompt_positions = compute_positions_3d(prompt, prompt_attention)
-        x, y, z = 0, 0, 1
-        prompt_list = prompt_tokens.tolist()
-        for idx, tok in enumerate(prompt_list):
-            _, (x, y, z) = _update_position_state(
-                x, y, z, int(tok), is_first=(idx == 0)
-            )
-
-    generated_tokens = prompt_tokens.tolist()
-    seq_len = len(generated_tokens)
-    generated = prompt.to(device)
-    example_ids_tensor = torch.tensor([example_id], dtype=torch.long, device=device)
-    prompt_positions = prompt_positions.to(device)
-
-    # First pass: run the full prompt to build KV cache and get initial logits.
-    outputs = model.forward_generate(
-        input_ids=generated,
-        example_ids=example_ids_tensor,
-        past_key_values=None,
-        positions_3d=prompt_positions,
-    )
-    logits = outputs["logits"]
-    past_key_values = outputs["past_key_values"]
-
-    start_time = time.perf_counter() if log_time else None
-
-    for _ in range(MAX_NEW_TOKENS):
-        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-        token_id = int(next_token.item())
-        generated_tokens.append(token_id)
-        seq_len += 1
-
-        if token_id == END_TOKEN_ID:
-            break
-        if seq_len >= model.config.max_seq_len:
-            print("Reached model max_seq_len during generation; stopping.")
-            break
-
-        pos, (x, y, z) = _update_position_state(x, y, z, token_id, is_first=False)
-        pos_tensor = torch.tensor([[list(pos)]], dtype=torch.long, device=device)
-
-        outputs = model.forward_generate(
-            input_ids=next_token,
-            example_ids=example_ids_tensor,
-            past_key_values=past_key_values,
-            positions_3d=pos_tensor,
-        )
-        logits = outputs["logits"]
-        past_key_values = outputs["past_key_values"]
-
-    if log_time and start_time is not None:
-        elapsed = time.perf_counter() - start_time
-        new_tokens = seq_len - len(prompt_tokens)
-        print(
-            f"Generation time: {elapsed:.3f}s for {new_tokens} new tokens "
-            f"(total length {seq_len})"
-        )
-
-    return torch.tensor(generated_tokens, dtype=torch.long)
-
-
 def run_inference(
     model: TinyTransformer,
     dataset: ARCExampleDataset,
@@ -403,35 +269,32 @@ def run_inference(
     log_prompt: bool = False,
     plot_grids_flag: bool = False,
 ) -> None:
-    candidate = None
-    for example in dataset.iter_examples(split="test", has_output=False):
-        if example.task_id == task_id and example.pair_index == pair_index:
-            candidate = example
-            break
-
-    if candidate is None:
-        raise ValueError(
-            f"No test example found for task_id={task_id} pair_index={pair_index}."
-        )
-
-    if log_prompt:
-        print(
-            "\nInference prompt (string):", tokens_to_string(candidate.tokens.tolist())
-        )
-
-    generated = greedy_generate(
+    start_time = time.perf_counter()
+    results = run_batched_inference(
         model=model,
-        prompt_tokens=candidate.tokens,
-        cached_positions=candidate.cached_positions,
-        example_id=candidate.example_id,
+        dataset=dataset,
+        task_ids=[task_id],
         device=device,
-        log_time=True,
+        pair_index=pair_index,
+        max_new_tokens=MAX_NEW_TOKENS,
+        log_prompts=log_prompt,
     )
-    full_sequence = generated.tolist()
-    output_tokens = extract_output_tokens(full_sequence)
-    predicted_grid = tokens_to_grid(output_tokens)
+    if not results:
+        print("No inference results were produced.")
+        return
+
+    result = results[0]
+    full_sequence = result["sequence"]
+    output_tokens = result["output_tokens"]
+    predicted_grid = result["output_grid"]
+    elapsed = time.perf_counter() - start_time
 
     print(f"\nInference results for task {task_id} pair {pair_index}")
+    print(
+        f"Generation time: {elapsed:.3f}s for "
+        f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
+        f"(total length {len(full_sequence)})"
+    )
     print("Generated raw (string):", tokens_to_string(full_sequence))
     print("Generated (string):", tokens_to_string(output_tokens))
     if predicted_grid:
@@ -443,12 +306,11 @@ def run_inference(
 
     if plot_grids_flag:
         try:
-            # Plot two grids: input (before separator) and generated output
-            prompt_grids = split_grids_from_tokens(candidate.tokens.tolist())
+            prompt_tokens = result.get("prompt_tokens", [])
+            prompt_grids = split_grids_from_tokens(prompt_tokens)
             gen_grids = split_grids_from_tokens(
-                [*candidate.tokens.tolist(), *output_tokens, END_TOKEN_ID]
+                [*prompt_tokens, *output_tokens, END_TOKEN_ID]
             )
-            # Prefer showing exactly two: the input grid(s) first segment and the predicted output
             input_grid = prompt_grids[0] if prompt_grids else []
             output_grid = (
                 gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
