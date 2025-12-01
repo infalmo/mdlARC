@@ -246,37 +246,149 @@ def batched_greedy_generate(
     return generated
 
 
-def _select_inference_examples(
-    dataset, task_ids: Sequence[str], pair_index: int = 0
+def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
+    if IO_SEPARATOR_TOKEN_ID not in tokens:
+        raise ValueError("Prompt sequence is missing <input_output_separator>.")
+    sep_idx = tokens.index(IO_SEPARATOR_TOKEN_ID)
+    return list(tokens[: sep_idx + 1])
+
+
+def _prepare_examples_for_inference(
+    examples: Sequence[object], include_targets: bool = False
 ) -> Tuple[
-    List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]
+    List[List[int]],
+    List[int],
+    List[Dict[str, object]],
+    List[Optional[torch.Tensor]],
+    List[List[int]],
 ]:
     prompts: List[List[int]] = []
     example_ids: List[int] = []
     metadata: List[Dict[str, object]] = []
     cached_positions: List[Optional[torch.Tensor]] = []
+    target_tokens: List[List[int]] = []
 
-    for task_id in task_ids:
-        candidate = None
-        for example in dataset.iter_examples(split="test", has_output=False):
-            if example.task_id == task_id and example.pair_index == pair_index:
-                candidate = example
-                break
-        if candidate is None:
-            raise ValueError(
-                f"No test example found for task_id={task_id} pair_index={pair_index}."
-            )
-        prompts.append(candidate.tokens.tolist())
-        example_ids.append(candidate.example_id)
-        cached_positions.append(getattr(candidate, "cached_positions", None))
+    for ex in examples:
+        if not hasattr(ex, "tokens"):
+            raise ValueError("Examples must provide a 'tokens' attribute.")
+        tokens = ex.tokens.tolist()
+        prompt_tokens = _build_prompt_from_tokens(tokens)
+        prompts.append(prompt_tokens)
+        example_ids.append(int(getattr(ex, "example_id", 0)))
+        cached = getattr(ex, "cached_positions", None)
+        if cached is not None:
+            cached_positions.append(cached[: len(prompt_tokens)])
+        else:
+            cached_positions.append(None)
+
+        targets: List[int] = []
+        if include_targets and getattr(ex, "has_output", False):
+            targets = extract_output_tokens(tokens)
+        target_tokens.append(targets)
         metadata.append(
             {
-                "task_id": candidate.task_id,
-                "pair_index": candidate.pair_index,
-                "example_id": candidate.example_id,
+                "task_id": getattr(ex, "task_id", None),
+                "pair_index": getattr(ex, "pair_index", None),
+                "example_id": getattr(ex, "example_id", None),
+                "split": getattr(ex, "split", None),
             }
         )
-    return prompts, example_ids, metadata, cached_positions
+
+    return prompts, example_ids, metadata, cached_positions, target_tokens
+
+
+def _build_generation_results(
+    sequences: Sequence[Sequence[int]],
+    metadata: Sequence[Dict[str, object]],
+    prompts: Sequence[Sequence[int]],
+    target_output_tokens: Sequence[Sequence[int]],
+) -> List[Dict[str, object]]:
+    results: List[Dict[str, object]] = []
+    for seq, meta, prompt, target in zip(
+        sequences, metadata, prompts, target_output_tokens
+    ):
+        output_tokens = extract_output_tokens(seq)
+        predicted_grid = tokens_to_grid(output_tokens)
+        target_grid = tokens_to_grid(target) if target else []
+        result = {
+            "task_id": meta.get("task_id"),
+            "pair_index": meta.get("pair_index"),
+            "example_id": meta.get("example_id"),
+            "split": meta.get("split"),
+            "prompt_tokens": list(prompt),
+            "sequence": list(seq),
+            "output_tokens": output_tokens,
+            "output_grid": predicted_grid,
+            "target_output_tokens": list(target),
+            "target_grid": target_grid,
+        }
+        results.append(result)
+    return results
+
+
+def _run_generation_batch(
+    model: TinyTransformer,
+    prompts: Sequence[Sequence[int]],
+    example_ids: Sequence[int],
+    metadata: Sequence[Dict[str, object]],
+    cached_positions: Sequence[Optional[torch.Tensor]],
+    device: torch.device,
+    max_new_tokens: int,
+    target_output_tokens: Optional[Sequence[Sequence[int]]] = None,
+) -> List[Dict[str, object]]:
+    sequences = batched_greedy_generate(
+        model=model,
+        prompts=prompts,
+        example_ids=example_ids,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        cached_positions=cached_positions,
+    )
+    return _build_generation_results(
+        sequences=sequences,
+        metadata=metadata,
+        prompts=prompts,
+        target_output_tokens=target_output_tokens
+        if target_output_tokens is not None
+        else [[] for _ in prompts],
+    )
+
+
+def _select_inference_examples(
+    dataset,
+    task_ids: Sequence[str],
+    split: str = "test",
+    pair_index: Optional[int] = 0,
+    require_outputs: bool = False,
+) -> Tuple[
+    List[List[int]],
+    List[int],
+    List[Dict[str, object]],
+    List[Optional[torch.Tensor]],
+    List[List[int]],
+]:
+    selected = []
+    for task_id in task_ids:
+        candidate = None
+        for example in dataset.iter_examples(split=split):
+            if example.task_id != task_id:
+                continue
+            if pair_index is not None and example.pair_index != pair_index:
+                continue
+            if require_outputs and not example.has_output:
+                continue
+            candidate = example
+            break
+        if candidate is None:
+            raise ValueError(
+                f"No {split} example found for task_id={task_id} pair_index={pair_index}."
+            )
+        selected.append(candidate)
+
+    prompts, example_ids, metadata, cached_positions, targets = (
+        _prepare_examples_for_inference(selected, include_targets=require_outputs)
+    )
+    return prompts, example_ids, metadata, cached_positions, targets
 
 
 @torch.no_grad()
@@ -285,12 +397,24 @@ def run_batched_inference(
     dataset,
     task_ids: Sequence[str],
     device: torch.device,
+    split: str = "test",
     pair_index: int = 0,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     log_prompts: bool = False,
+    include_targets: bool = False,
 ) -> List[Dict[str, object]]:
-    prompts, example_ids, metadata, cached_positions = _select_inference_examples(
-        dataset, task_ids, pair_index=pair_index
+    (
+        prompts,
+        example_ids,
+        metadata,
+        cached_positions,
+        target_output_tokens,
+    ) = _select_inference_examples(
+        dataset,
+        task_ids,
+        split=split,
+        pair_index=pair_index,
+        require_outputs=include_targets,
     )
     if log_prompts:
         for meta, prompt in zip(metadata, prompts):
@@ -310,23 +434,187 @@ def run_batched_inference(
         max_new_tokens=max_new_tokens,
         cached_positions=cached_positions,
     )
+    return _build_generation_results(
+        sequences=sequences,
+        metadata=metadata,
+        prompts=prompts,
+        target_output_tokens=target_output_tokens
+        if include_targets
+        else [[] for _ in prompts],
+    )
+
+
+def _gather_examples_for_split(
+    dataset,
+    split: str,
+    task_ids: Optional[Sequence[str]] = None,
+    pair_index: Optional[int] = None,
+    require_outputs: bool = False,
+):
+    examples = []
+    for example in dataset.iter_examples(split=split):
+        if task_ids is not None and example.task_id not in task_ids:
+            continue
+        if pair_index is not None and example.pair_index != pair_index:
+            continue
+        if require_outputs and not example.has_output:
+            continue
+        examples.append(example)
+    return examples
+
+
+@torch.no_grad()
+def run_split_inference(
+    model: TinyTransformer,
+    dataset,
+    split: str,
+    device: torch.device,
+    batch_size: int = 16,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    task_ids: Optional[Sequence[str]] = None,
+    pair_index: Optional[int] = None,
+    log_prompts: bool = False,
+    include_targets: bool = True,
+) -> List[Dict[str, object]]:
+    examples = _gather_examples_for_split(
+        dataset,
+        split=split,
+        task_ids=task_ids,
+        pair_index=pair_index,
+        require_outputs=include_targets,
+    )
+    if not examples:
+        return []
 
     results: List[Dict[str, object]] = []
-    for seq, meta, prompt in zip(sequences, metadata, prompts):
-        output_tokens = extract_output_tokens(seq)
-        predicted_grid = tokens_to_grid(output_tokens)
-        results.append(
-            {
-                "task_id": meta["task_id"],
-                "pair_index": meta["pair_index"],
-                "example_id": meta["example_id"],
-                "prompt_tokens": prompt,
-                "sequence": seq,
-                "output_tokens": output_tokens,
-                "output_grid": predicted_grid,
-            }
+    for start in range(0, len(examples), batch_size):
+        batch_examples = examples[start : start + batch_size]
+        (
+            prompts,
+            example_ids,
+            metadata,
+            cached_positions,
+            target_output_tokens,
+        ) = _prepare_examples_for_inference(
+            batch_examples, include_targets=include_targets
         )
+        if log_prompts:
+            for meta, prompt in zip(metadata, prompts):
+                print(
+                    "[prompt]",
+                    f"split={meta.get('split')}",
+                    f"task={meta.get('task_id')}",
+                    f"pair={meta.get('pair_index')}",
+                    "::",
+                    tokens_to_string(prompt),
+                )
+        batch_results = _run_generation_batch(
+            model=model,
+            prompts=prompts,
+            example_ids=example_ids,
+            metadata=metadata,
+            cached_positions=cached_positions,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            target_output_tokens=target_output_tokens if include_targets else None,
+        )
+        results.extend(batch_results)
     return results
+
+
+def _has_correct_shape(
+    sequence: Sequence[int],
+    predicted_tokens: Sequence[int],
+    target_tokens: Sequence[int],
+) -> bool:
+    if not target_tokens:
+        return False
+    if len(predicted_tokens) != len(target_tokens):
+        return False
+
+    target_newlines = [idx for idx, tok in enumerate(target_tokens) if tok == NEXT_LINE_TOKEN_ID]
+    predicted_newlines = [
+        idx for idx, tok in enumerate(predicted_tokens) if tok == NEXT_LINE_TOKEN_ID
+    ]
+    if target_newlines != predicted_newlines:
+        return False
+
+    try:
+        sep_idx = sequence.index(IO_SEPARATOR_TOKEN_ID)
+        end_idx = sequence.index(END_TOKEN_ID, sep_idx + 1)
+    except ValueError:
+        return False
+    return (end_idx - (sep_idx + 1)) == len(target_tokens)
+
+
+def _pixel_accuracy(
+    predicted_tokens: Sequence[int], target_tokens: Sequence[int]
+) -> Optional[float]:
+    predicted_digits = [tok for tok in predicted_tokens if 0 <= tok <= 9]
+    target_digits = [tok for tok in target_tokens if 0 <= tok <= 9]
+    if not target_digits or len(predicted_digits) != len(target_digits):
+        return None
+    correct = sum(1 for p, t in zip(predicted_digits, target_digits) if p == t)
+    return correct / len(target_digits)
+
+
+def summarize_split_results(results: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    num_shape_correct = 0
+    num_fully_correct = 0
+    accuracies: List[float] = []
+    fully_correct_results: List[Dict[str, object]] = []
+
+    for res in results:
+        predicted_tokens = res.get("output_tokens", [])
+        target_tokens = res.get("target_output_tokens", [])
+        sequence = res.get("sequence", [])
+        shape_ok = _has_correct_shape(sequence, predicted_tokens, target_tokens)
+        res["shape_correct"] = shape_ok
+        if not shape_ok:
+            continue
+        num_shape_correct += 1
+        acc = _pixel_accuracy(predicted_tokens, target_tokens)
+        if acc is not None:
+            res["pixel_accuracy"] = acc
+            accuracies.append(acc)
+        if predicted_tokens == target_tokens:
+            num_fully_correct += 1
+            fully_correct_results.append(res)
+
+    avg_pixel_accuracy = sum(accuracies) / len(accuracies) if accuracies else 0.0
+    return {
+        "total_sequences": len(results),
+        "num_shape_correct": num_shape_correct,
+        "avg_pixel_accuracy": avg_pixel_accuracy,
+        "num_fully_correct": num_fully_correct,
+        "fully_correct_results": fully_correct_results,
+    }
+
+
+def evaluate_model_on_dataset(
+    model: TinyTransformer,
+    dataset,
+    device: torch.device,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    batch_size: int = 16,
+    splits: Sequence[str] = ("train", "test"),
+    log_prompts: bool = False,
+) -> Dict[str, Dict[str, object]]:
+    evaluation: Dict[str, Dict[str, object]] = {}
+    for split in splits:
+        split_results = run_split_inference(
+            model=model,
+            dataset=dataset,
+            split=split,
+            device=device,
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            log_prompts=log_prompts,
+            include_targets=True,
+        )
+        summary = summarize_split_results(split_results)
+        evaluation[split] = {"results": split_results, "summary": summary}
+    return evaluation
 
 
 def run_inference(
@@ -335,6 +623,7 @@ def run_inference(
     task_id: str,
     pair_index: int,
     device: torch.device,
+    split: str = "test",
     log_prompt: bool = False,
     plot_grids_flag: bool = False,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
@@ -345,6 +634,7 @@ def run_inference(
         dataset=dataset,
         task_ids=[task_id],
         device=device,
+        split=split,
         pair_index=pair_index,
         max_new_tokens=max_new_tokens,
         log_prompts=log_prompt,
@@ -359,7 +649,7 @@ def run_inference(
     predicted_grid = result["output_grid"]
     elapsed = time.perf_counter() - start_time
 
-    print(f"\nInference results for task {task_id} pair {pair_index}")
+    print(f"\nInference results for task {task_id} pair {pair_index} ({split} split)")
     print(
         f"Generation time: {elapsed:.3f}s for "
         f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
