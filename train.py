@@ -160,6 +160,7 @@ def train_one_epoch(
             print(log_msg)
 
             if log_file:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(log_file, "a") as f:
                     f.write(log_msg + "\n")
 
