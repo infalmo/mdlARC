@@ -2,7 +2,6 @@ import json
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
-
 import torch
 
 from tinytransformer import TinyTransformer
@@ -398,8 +397,10 @@ def _select_inference_examples(
             )
         selected.append(candidate)
 
-    prompts, example_ids, metadata, cached_positions, targets = _prepare_examples_for_inference(
-        selected, include_targets=require_outputs, solutions=solutions
+    prompts, example_ids, metadata, cached_positions, targets = (
+        _prepare_examples_for_inference(
+            selected, include_targets=require_outputs, solutions=solutions
+        )
     )
     return prompts, example_ids, metadata, cached_positions, targets
 
@@ -417,19 +418,15 @@ def run_batched_inference(
     include_targets: bool = False,
 ) -> List[Dict[str, object]]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
-    (
-        prompts,
-        example_ids,
-        metadata,
-        cached_positions,
-        target_output_tokens,
-    ) = _select_inference_examples(
-        dataset,
-        task_ids,
-        split=split,
-        pair_index=pair_index,
-        require_outputs=include_targets,
-        solutions=solutions,
+    (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
+        _select_inference_examples(
+            dataset,
+            task_ids,
+            split=split,
+            pair_index=pair_index,
+            require_outputs=include_targets,
+            solutions=solutions,
+        )
     )
     if log_prompts:
         for meta, prompt in zip(metadata, prompts):
@@ -459,9 +456,7 @@ def run_batched_inference(
     )
 
 
-def _load_solutions_for_dataset(
-    dataset,
-) -> Dict[Tuple[str, int], List[List[int]]]:
+def _load_solutions_for_dataset(dataset) -> Dict[Tuple[str, int], List[List[int]]]:
     """Load solutions.json located next to the dataset (used only for evaluation).
 
     Expected structure:
@@ -538,14 +533,10 @@ def run_split_inference(
     results: List[Dict[str, object]] = []
     for start in range(0, len(examples), batch_size):
         batch_examples = examples[start : start + batch_size]
-        (
-            prompts,
-            example_ids,
-            metadata,
-            cached_positions,
-            target_output_tokens,
-        ) = _prepare_examples_for_inference(
-            batch_examples, include_targets=include_targets, solutions=solutions
+        (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
+            _prepare_examples_for_inference(
+                batch_examples, include_targets=include_targets, solutions=solutions
+            )
         )
         if log_prompts:
             for meta, prompt in zip(metadata, prompts):
@@ -581,7 +572,9 @@ def _has_correct_shape(
     if len(predicted_tokens) != len(target_tokens):
         return False
 
-    target_newlines = [idx for idx, tok in enumerate(target_tokens) if tok == NEXT_LINE_TOKEN_ID]
+    target_newlines = [
+        idx for idx, tok in enumerate(target_tokens) if tok == NEXT_LINE_TOKEN_ID
+    ]
     predicted_newlines = [
         idx for idx, tok in enumerate(predicted_tokens) if tok == NEXT_LINE_TOKEN_ID
     ]

@@ -116,9 +116,7 @@ class MultiHeadSelfAttention(nn.Module):
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
         if attention_mask is not None:
-            attention_mask = attention_mask.to(
-                device=queries.device, dtype=torch.bool
-            )
+            attention_mask = attention_mask.to(device=queries.device, dtype=torch.bool)
 
         # Incremental decoding branch: concatenate cached K/V and attend
         # from the new tokens only. No causal mask is needed because there
@@ -128,9 +126,7 @@ class MultiHeadSelfAttention(nn.Module):
             keys = torch.cat([past_keys, keys], dim=2)
             values = torch.cat([past_values, values], dim=2)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(
-                    device=keys.device, dtype=torch.bool
-                )
+                attention_mask = attention_mask.to(device=keys.device, dtype=torch.bool)
                 if attention_mask.dim() != 2 or attention_mask.size(1) != keys.size(2):
                     raise ValueError(
                         "attention_mask must have shape [batch, total_seq_len] when using KV cache."
@@ -140,7 +136,11 @@ class MultiHeadSelfAttention(nn.Module):
             if attention_mask is not None:
                 key_mask = ~attention_mask[:, None, None, :]
                 attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
-            query_mask = attention_mask[:, None, -seq_len:, None] if attention_mask is not None else None
+            query_mask = (
+                attention_mask[:, None, -seq_len:, None]
+                if attention_mask is not None
+                else None
+            )
             if query_mask is not None:
                 attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
             attn_weights = F.softmax(attn_scores, dim=-1)
@@ -149,9 +149,7 @@ class MultiHeadSelfAttention(nn.Module):
                 attn_weights = attn_weights * query_mask
             attn_output = torch.matmul(attn_weights, values)
             attn_output = (
-                attn_output.transpose(1, 2)
-                .contiguous()
-                .view(batch_size, seq_len, dim)
+                attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
             )
             attn_output = self.out_proj(attn_output)
             present_key_value = (keys, values)
@@ -168,7 +166,9 @@ class MultiHeadSelfAttention(nn.Module):
         if attention_mask is not None:
             key_mask = ~attention_mask[:, None, None, :]
             attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
-        query_mask = attention_mask[:, None, :, None] if attention_mask is not None else None
+        query_mask = (
+            attention_mask[:, None, :, None] if attention_mask is not None else None
+        )
         if query_mask is not None:
             attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
 
@@ -424,7 +424,9 @@ class TinyTransformer(nn.Module):
             return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
         if pos_xyz is None:
-            raise ValueError("positions_3d must be provided when using past_key_values.")
+            raise ValueError(
+                "positions_3d must be provided when using past_key_values."
+            )
 
         if attention_mask is not None:
             past_seq_len = past_key_values[0][0].size(2)
@@ -489,9 +491,15 @@ class RotaryEmbedding3D(nn.Module):
         self.d_y = py * 2
         self.d_z = pz * 2
         # Precompute inverse frequency for each axis slice
-        self.register_buffer("inv_freq_x", self._build_inv_freq(self.d_x), persistent=False)
-        self.register_buffer("inv_freq_y", self._build_inv_freq(self.d_y), persistent=False)
-        self.register_buffer("inv_freq_z", self._build_inv_freq(self.d_z), persistent=False)
+        self.register_buffer(
+            "inv_freq_x", self._build_inv_freq(self.d_x), persistent=False
+        )
+        self.register_buffer(
+            "inv_freq_y", self._build_inv_freq(self.d_y), persistent=False
+        )
+        self.register_buffer(
+            "inv_freq_z", self._build_inv_freq(self.d_z), persistent=False
+        )
 
     def _build_inv_freq(self, dim: int) -> torch.Tensor:
         if dim <= 0:
@@ -521,10 +529,7 @@ class RotaryEmbedding3D(nn.Module):
         return cos, sin
 
     def apply_rotary(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        pos_xyz: torch.Tensor,
+        self, q: torch.Tensor, k: torch.Tensor, pos_xyz: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply 3D RoPE to the first d_x, d_y, d_z channels respectively.
 

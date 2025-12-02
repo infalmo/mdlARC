@@ -12,11 +12,6 @@ import numpy as np
 from tinytransformer import TinyTransformer, TinyTransformerConfig
 from utils import ARCExampleDataset, MAX_SEQ_LEN, create_dataloader, tokens_to_string
 
-# Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
 
@@ -30,6 +25,9 @@ def resolve_device(device_str: str) -> torch.device:
     device_str = device_str.lower()
     if device_str == "cuda":
         if torch.cuda.is_available():
+            # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
             return torch.device("cuda")
         print("CUDA not available, falling back to CPU.")
         return torch.device("cpu")
@@ -288,7 +286,7 @@ def build_model_and_data(
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
-        shuffle=not args.eval_only,
+        shuffle=not getattr(args, "eval_only", True),
         num_workers=args.num_workers,
     )
 
