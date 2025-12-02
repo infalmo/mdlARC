@@ -105,6 +105,7 @@ def train_one_epoch(
     start_step: int = 0,
     log_train_strings: bool = False,
     log_train_limit: int = 0,
+    log_file: Optional[Path] = None,  # <--- NEW ARGUMENT
 ) -> int:
     model.train()
     step = start_step
@@ -132,6 +133,7 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+
         # Optional: log the exact serialized strings the model is trained on
         if log_train_strings and logged < log_train_limit:
             bs = input_ids.size(0)
@@ -154,7 +156,13 @@ def train_one_epoch(
                     break
         if step % 10 == 0:
             avg_loss = total_loss / 10
-            print(f"step={step} avg_loss={avg_loss:.4f}")
+            log_msg = f"step={step} avg_loss={avg_loss:.4f}"
+            print(log_msg)
+
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(log_msg + "\n")
+
             total_loss = 0.0
     return step
 
@@ -337,6 +345,9 @@ def train_model(
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
 
+    # Extract log file from args if it exists
+    log_file = getattr(args, "train_log_file", None)
+
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
     optimizer = AdamW(param_groups, lr=args.lr)
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
@@ -353,7 +364,6 @@ def train_model(
                     state[k] = v.to(device)
         print("Restored optimizer state from checkpoint.")
 
-    # model = torch.compile(model)
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         step = train_one_epoch(
@@ -365,7 +375,9 @@ def train_model(
             start_step=step,
             log_train_strings=args.log_train_strings,
             log_train_limit=args.log_train_limit,
+            log_file=log_file,  # <--- Pass it down
         )
+
     rng_state = _capture_rng_state(device)
     maybe_save_model(
         model,
