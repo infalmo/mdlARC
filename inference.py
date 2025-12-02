@@ -752,3 +752,57 @@ def greedy_generate(
         )
 
     return torch.tensor(sequences[0], dtype=torch.long)
+
+
+def group_eval_sequences_by_task(
+    evaluation: Dict[str, Dict[str, object]],
+) -> Dict[str, Dict[str, List[List[int]]]]:
+    """
+    Restructures evaluation results into a format optimized for export:
+    {
+      "split_name": {
+        "task_id": [ <sequence_pair_0>, <sequence_pair_1>, ... ]
+      }
+    }
+    """
+    output = {}
+    for split, split_data in evaluation.items():
+        results = split_data.get("results", [])
+
+        # 1. Group by task_id -> pair_index -> sequence
+        # We use a dict first to handle potential out-of-order processing
+        task_map: Dict[str, Dict[int, List[int]]] = {}
+
+        for res in results:
+            task_id = res.get("task_id")
+            pair_index = res.get("pair_index")
+            sequence = res.get("sequence")
+
+            # Basic validation
+            if task_id is None or pair_index is None or sequence is None:
+                continue
+
+            if task_id not in task_map:
+                task_map[task_id] = {}
+            task_map[task_id][pair_index] = sequence
+
+        # 2. Convert pair-maps to sorted lists
+        output[split] = {}
+        for task_id, pairs_dict in task_map.items():
+            if not pairs_dict:
+                output[split][task_id] = []
+                continue
+
+            # Determine list size based on the highest pair index found
+            max_idx = max(pairs_dict.keys())
+
+            # Pre-fill with empty lists to handle potential non-contiguous indices safely
+            # (Though ARC data is usually contiguous 0..N)
+            seq_list = [[] for _ in range(max_idx + 1)]
+
+            for idx, seq in pairs_dict.items():
+                seq_list[idx] = seq
+
+            output[split][task_id] = seq_list
+
+    return output
