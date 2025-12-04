@@ -5,7 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import IGNORE_INDEX, MAX_SEQ_LEN, VOCAB_SIZE, compute_positions_3d
+from utils import (
+    IGNORE_INDEX,
+    MAX_SEQ_LEN,
+    VOCAB_SIZE,
+    compute_positions_3d,
+    IO_SEPARATOR_TOKEN_ID,
+)
 
 
 @dataclass
@@ -336,17 +342,61 @@ class TinyTransformer(nn.Module):
         logits = self.lm_head(hidden_states)
 
         loss = None
+        input_loss = None
+        output_loss = None
+
         if targets is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_targets = targets[:, 1:].contiguous()
             shift_mask = attention_mask[:, 1:].contiguous()
             shift_targets = shift_targets.masked_fill(~shift_mask, IGNORE_INDEX)
-            loss = F.cross_entropy(
+
+            # 1. Calculate per-token loss (reduction='none')
+            raw_losses = F.cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_targets.view(-1),
                 ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view(batch_size, -1)
+
+            # 2. Identify which tokens are valid (not ignored)
+            valid_mask = shift_targets != IGNORE_INDEX
+            total_valid = valid_mask.sum()
+
+            # 3. Standard total loss (for backprop)
+            # Use clamp(min=1) to avoid division by zero if a batch is entirely padding
+            loss = raw_losses.sum() / total_valid.clamp(min=1)
+
+            # 4. Separate Input vs Output portions
+            # The input sequence (shift_logits input) is input_ids[:, :-1]
+            shift_input_ids = input_ids[:, :-1]
+
+            # Find where the Output phase starts.
+            # If the current input token is IO_SEPARATOR, it is predicting the first output token.
+            # So, the "Output Loss" region starts wherever SEP or subsequent tokens appear.
+            # cumsum >= 1 creates a mask that turns True from the Separator onwards.
+            is_output_phase = (shift_input_ids == IO_SEPARATOR_TOKEN_ID).cumsum(
+                dim=1
+            ) >= 1
+            is_input_phase = ~is_output_phase
+
+            # Calculate specific losses
+            valid_input = valid_mask & is_input_phase
+            valid_output = valid_mask & is_output_phase
+
+            input_loss = (raw_losses * valid_input).sum() / valid_input.sum().clamp(
+                min=1
             )
-        return {"logits": logits, "loss": loss}
+            output_loss = (raw_losses * valid_output).sum() / valid_output.sum().clamp(
+                min=1
+            )
+
+        return {
+            "logits": logits,
+            "loss": loss,
+            "input_loss": input_loss,
+            "output_loss": output_loss,
+        }
 
     def forward_generate(
         self,

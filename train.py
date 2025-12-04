@@ -110,6 +110,8 @@ def train_one_epoch(
     model.train()
     step = start_step
     total_loss = 0.0
+    total_input_loss = 0.0
+    total_output_loss = 0.0
     logged = 0
     for batch in dataloader:
         step += 1
@@ -126,6 +128,8 @@ def train_one_epoch(
             positions_3d=positions_3d,
         )
         loss = outputs["loss"]
+        inp_loss = outputs.get("input_loss")
+        out_loss = outputs.get("output_loss")
 
         optimizer.zero_grad()
         loss.backward()
@@ -134,6 +138,8 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+        total_input_loss += inp_loss.item() if inp_loss is not None else 0.0
+        total_output_loss += out_loss.item() if out_loss is not None else 0.0
 
         # Optional: log the exact serialized strings the model is trained on
         if log_train_strings and logged < log_train_limit:
@@ -157,7 +163,10 @@ def train_one_epoch(
                     break
         if step % 10 == 0:
             avg_loss = total_loss / 10
-            log_msg = f"step={step} avg_loss={avg_loss:.4f}"
+            avg_inp = total_input_loss / 10
+            avg_out = total_output_loss / 10
+
+            log_msg = f"step={step} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
             print(log_msg)
 
             if log_file:
@@ -166,6 +175,8 @@ def train_one_epoch(
                     f.write(log_msg + "\n")
 
             total_loss = 0.0
+            total_input_loss = 0.0
+            total_output_loss = 0.0
     return step
 
 
