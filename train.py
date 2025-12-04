@@ -354,6 +354,45 @@ def build_model_and_data(
     return model, dataset, dataloader, device, data_path
 
 
+@torch.no_grad()
+def validate_one_epoch(
+    model: TinyTransformer,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> float:
+    """Calculates validation loss (Output Loss) on the test set."""
+    model.eval()
+    total_output_loss = 0.0
+    num_batches = 0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
+
+        # We only care about validation on examples that actually have outputs
+        # (The val_dataset should be constructed such that has_output is True)
+        if not any(batch["has_output"]):
+            continue
+
+        outputs = model(
+            input_ids,
+            example_ids,
+            attention_mask=attention_mask,
+            positions_3d=positions_3d,
+        )
+
+        # 'output_loss' is the specific loss on tokens AFTER the separator
+        out_loss = outputs.get("output_loss")
+
+        if out_loss is not None:
+            total_output_loss += out_loss.item()
+            num_batches += 1
+
+    return total_output_loss / max(1, num_batches)
+
+
 def train_model(
     args: argparse.Namespace,
     model: TinyTransformer,
@@ -366,6 +405,27 @@ def train_model(
     """Run the training loop only (no evaluation)."""
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
+
+    # Create a separate Validation Dataset/Loader that accesses solutions.json
+    # We only include the 'test' split here to calculate validation loss.
+    # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
+    print("Building validation dataloader (reading hidden solutions)...")
+    val_dataset = ARCExampleDataset(
+        json_path=data_path,
+        splits=("test",),  # Only test split for validation
+        include_outputs=True,  # We need outputs to calculate loss
+        load_test_solutions=True,  # <--- Loads solutions.json
+        max_seq_len=MAX_SEQ_LEN,
+        task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
+    )
+
+    val_dataloader = create_dataloader(
+        dataset=val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    print(f"Validation dataset size: {len(val_dataset)}")
 
     # Extract log file from args if it exists
     log_file = getattr(args, "train_log_file", None)
@@ -399,6 +459,8 @@ def train_model(
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
+
+        # Run Training
         step = train_one_epoch(
             model=training_model,
             dataloader=dataloader,
@@ -410,6 +472,20 @@ def train_model(
             log_train_limit=args.log_train_limit,
             log_file=log_file,  # <--- Pass it down
         )
+
+        # Run Validation
+        val_loss = validate_one_epoch(
+            model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
+            dataloader=val_dataloader,
+            device=device,
+        )
+
+        val_msg = f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
+        print(val_msg)
+
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(val_msg + "\n")
 
     rng_state = _capture_rng_state(device)
     maybe_save_model(
