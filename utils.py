@@ -1,7 +1,8 @@
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -264,6 +265,236 @@ def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
     if current_grid:
         grids.append(current_grid)
     return grids
+
+
+_DIHEDRAL_TRANSFORM_NAMES = [
+    "identity",
+    "rot90",
+    "rot180",
+    "rot270",
+    "flip_horizontal",
+    "flip_vertical",
+    "flip_main_diagonal",
+    "flip_anti_diagonal",
+]
+
+
+def _dihedral_copy(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(row) for row in grid]
+
+
+def _dihedral_rot90(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid[::-1])]
+
+
+def _dihedral_rot180(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(reversed(row)) for row in reversed(grid)]
+
+
+def _dihedral_rot270(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid)][::-1]
+
+
+def _dihedral_flip_horizontal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(reversed(row)) for row in grid]
+
+
+def _dihedral_flip_vertical(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(row) for row in reversed(grid)]
+
+
+def _dihedral_flip_main_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid)]
+
+
+def _dihedral_flip_anti_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return _dihedral_flip_vertical(_dihedral_rot90(grid))
+
+
+_DIHEDRAL_TRANSFORMS = {
+    "identity": _dihedral_copy,
+    "rot90": _dihedral_rot90,
+    "rot180": _dihedral_rot180,
+    "rot270": _dihedral_rot270,
+    "flip_horizontal": _dihedral_flip_horizontal,
+    "flip_vertical": _dihedral_flip_vertical,
+    "flip_main_diagonal": _dihedral_flip_main_diagonal,
+    "flip_anti_diagonal": _dihedral_flip_anti_diagonal,
+}
+
+_DIHEDRAL_INVERSES = {
+    "identity": "identity",
+    "rot90": "rot270",
+    "rot180": "rot180",
+    "rot270": "rot90",
+    "flip_horizontal": "flip_horizontal",
+    "flip_vertical": "flip_vertical",
+    "flip_main_diagonal": "flip_main_diagonal",
+    "flip_anti_diagonal": "flip_anti_diagonal",
+}
+
+
+def is_rectangular_grid(grid: Sequence[Sequence[int]]) -> bool:
+    """Return True if all rows have the same non-zero length."""
+    if not grid:
+        return False
+    first_row_len = len(grid[0])
+    if first_row_len == 0:
+        return False
+    return all(len(row) == first_row_len for row in grid)
+
+
+def apply_inverse_dihedral_transform(
+    grid: Sequence[Sequence[int]], transform_index: int
+) -> List[List[int]]:
+    """Undo a dihedral transform using the known augmentation index (mod 8)."""
+    if transform_index < 0:
+        raise ValueError("transform_index must be non-negative.")
+    transform_name = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
+    inverse_name = _DIHEDRAL_INVERSES[transform_name]
+    return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
+
+
+def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
+    return tuple(tuple(int(val) for val in row) for row in grid)
+
+
+def _tuple_to_grid(grid_tuple: Tuple[Tuple[int, ...], ...]) -> List[List[int]]:
+    return [list(row) for row in grid_tuple]
+
+
+@dataclass
+class AAIVRSelection:
+    task_id: str
+    original_pair_index: int
+    selected_outputs: List[List[List[int]]]
+    ranked_candidates: List[Dict[str, object]]
+    num_generated: int
+    num_valid: int
+    discarded_non_rectangular: int
+    discarded_input_copies: int
+    target_grid: Optional[List[List[int]]] = None
+    pass_at_k: Optional[bool] = None
+
+
+def run_aaivr_on_results(
+    results: Sequence[Dict[str, object]],
+    top_k: int = 2,
+    discard_input_copies: bool = True,
+    rng: Optional[random.Random] = None,
+) -> List[AAIVRSelection]:
+    """Aggregate augmented predictions via AAIVR voting.
+
+    The function assumes pair_index encodes augmentation order (mod 8). It
+    returns up to `top_k` most common inverse-transformed outputs per
+    original test input.
+    """
+    rng = rng if rng is not None else random
+    case_map: Dict[Tuple[str, int], Dict[str, object]] = {}
+
+    for res in results:
+        task_id = res.get("task_id")
+        pair_index = res.get("pair_index")
+        if task_id is None or pair_index is None:
+            continue
+
+        base_pair_index = int(pair_index) // 8
+        transform_index = int(pair_index) % 8
+        predicted_grid = res.get("output_grid", [])
+        prompt_tokens = res.get("prompt_tokens", [])
+        input_grids = split_grids_from_tokens(prompt_tokens)
+        input_grid = input_grids[0] if input_grids else []
+
+        key = (task_id, base_pair_index)
+        if key not in case_map:
+            case_map[key] = {
+                "counts": {},
+                "generated": 0,
+                "valid": 0,
+                "dropped_rect": 0,
+                "dropped_input": 0,
+                "target_grid": None,
+            }
+        stats = case_map[key]
+        stats["generated"] += 1
+
+        if not is_rectangular_grid(predicted_grid):
+            stats["dropped_rect"] += 1
+            continue
+        if discard_input_copies and input_grid and predicted_grid == input_grid:
+            stats["dropped_input"] += 1
+            continue
+
+        try:
+            normalized_grid = apply_inverse_dihedral_transform(
+                predicted_grid, transform_index
+            )
+        except Exception:
+            stats["dropped_rect"] += 1
+            continue
+
+        if not is_rectangular_grid(normalized_grid):
+            stats["dropped_rect"] += 1
+            continue
+
+        stats["valid"] += 1
+        grid_key = _grid_to_tuple(normalized_grid)
+        counts: Dict[Tuple[Tuple[int, ...], ...], int] = stats["counts"]
+        counts[grid_key] = counts.get(grid_key, 0) + 1
+
+        target_grid = res.get("target_grid", [])
+        if stats["target_grid"] is None and is_rectangular_grid(target_grid):
+            normalized_target = apply_inverse_dihedral_transform(
+                target_grid, transform_index
+            )
+            stats["target_grid"] = normalized_target if is_rectangular_grid(normalized_target) else None
+
+    selections: List[AAIVRSelection] = []
+    for (task_id, base_idx), stats in sorted(case_map.items()):
+        items = list(stats["counts"].items())
+        if items:
+            rng.shuffle(items)  # tie-break randomly before sorting by count
+            items.sort(key=lambda pair: pair[1], reverse=True)
+        ranked_candidates = [
+            {"grid": _tuple_to_grid(grid_key), "count": count}
+            for grid_key, count in items
+        ]
+        selected_outputs = [entry["grid"] for entry in ranked_candidates[:top_k]]
+
+        target_grid = stats.get("target_grid")
+        pass_at_k = None
+        if target_grid is not None:
+            pass_at_k = any(grid == target_grid for grid in selected_outputs)
+
+        selections.append(
+            AAIVRSelection(
+                task_id=task_id,
+                original_pair_index=base_idx,
+                selected_outputs=selected_outputs,
+                ranked_candidates=ranked_candidates,
+                num_generated=stats["generated"],
+                num_valid=stats["valid"],
+                discarded_non_rectangular=stats["dropped_rect"],
+                discarded_input_copies=stats["dropped_input"],
+                target_grid=target_grid,
+                pass_at_k=pass_at_k,
+            )
+        )
+
+    return selections
+
+
+def summarize_aaivr_pass_at_k(selections: Sequence[AAIVRSelection]) -> Dict[str, int]:
+    """Return counts for how many selections have the target in top-k."""
+    evaluated = [sel for sel in selections if sel.pass_at_k is not None]
+    hits = [sel for sel in evaluated if sel.pass_at_k]
+    return {"evaluated": len(evaluated), "hits": len(hits)}
 
 
 DEFAULT_COLORS = [
