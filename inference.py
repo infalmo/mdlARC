@@ -197,6 +197,7 @@ def batched_greedy_generate(
     )
     grid_state = BatchGridState(initial_state)
 
+    # 1. Initial Prompt Pass
     running_attention_mask = attention_mask.clone()
     outputs = model.forward_generate(
         input_ids=input_ids,
@@ -206,10 +207,38 @@ def batched_greedy_generate(
         attention_mask=running_attention_mask,
     )
     logits = outputs["logits"]
-    past_key_values = outputs["past_key_values"]
+    prompt_past_key_values = outputs["past_key_values"]
+
+    # 2. Pre-allocate KV Cache
+    # We create a buffer of (Batch, Heads, MaxSeqLen, Dim) and copy the prompt KV into it.
+    max_len = model.config.max_seq_len
+    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    current_len = input_ids.size(1)
+
+    for k, v in prompt_past_key_values:
+        # k, v are [Batch, Heads, PromptLen, Dim]
+        # create buffer
+        B, H, L, D = k.shape
+        k_buffer = torch.zeros((B, H, max_len, D), dtype=k.dtype, device=k.device)
+        v_buffer = torch.zeros((B, H, max_len, D), dtype=v.dtype, device=v.device)
+
+        # Copy prompt data
+        k_buffer[:, :, :L, :] = k
+        v_buffer[:, :, :L, :] = v
+        past_key_values.append((k_buffer, v_buffer))
+
+    past_key_values = tuple(past_key_values)
+    cache_position = current_len  # We start generating at this index
 
     max_steps_allowed = max(model.config.max_seq_len - input_ids.size(1), 0)
     steps_remaining = min(max_new_tokens, max_steps_allowed)
+
+    # Instead of appending to python lists (CPU) every step, we write to this tensor.
+    generated_tokens_buffer = torch.full(
+        (batch_size, steps_remaining), END_TOKEN_ID, dtype=torch.long, device=device
+    )
+
     if steps_remaining <= 0 or finished.all():
         return [list(seq) for seq in prompts]
 
@@ -224,9 +253,8 @@ def batched_greedy_generate(
         should_append = ~finished
         token_positions = grid_state.update(next_token).unsqueeze(1)
 
-        for idx, append_flag in enumerate(should_append.tolist()):
-            if append_flag:
-                generated[idx].append(int(next_token[idx].item()))
+        # Write to GPU buffer directly. No .item(), no .tolist(), no CPU sync.
+        generated_tokens_buffer[:, steps] = next_token
 
         finished = finished | (next_token == END_TOKEN_ID)
 
@@ -239,13 +267,27 @@ def batched_greedy_generate(
             past_key_values=past_key_values,
             positions_3d=token_positions,
             attention_mask=running_attention_mask,
+            cache_position=cache_position,
         )
         logits = outputs["logits"]
-        past_key_values = outputs["past_key_values"]
+        # past_key_values = outputs["past_key_values"]
 
         steps += 1
+        cache_position += 1
 
-    return generated
+    generated_cpu = generated_tokens_buffer[:, :steps].tolist()
+
+    results = []
+    for i, prompt in enumerate(prompts):
+        gen_seq = []
+        # Extract valid tokens until the first END_TOKEN_ID
+        for token in generated_cpu[i]:
+            gen_seq.append(token)
+            if token == END_TOKEN_ID:
+                break
+        results.append(list(prompt) + gen_seq)
+
+    return results
 
 
 def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:

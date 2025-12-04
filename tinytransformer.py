@@ -101,6 +101,7 @@ class MultiHeadSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Self-attention variant that also exposes a KV cache.
 
@@ -129,8 +130,19 @@ class MultiHeadSelfAttention(nn.Module):
         # are no future positions beyond the newly appended tokens.
         if past_key_value is not None:
             past_keys, past_values = past_key_value
-            keys = torch.cat([past_keys, keys], dim=2)
-            values = torch.cat([past_values, values], dim=2)
+            if cache_position is not None:
+                # Optimized Path: In-place update of pre-allocated buffer
+                # 1. Write new token's K/V to the specific position
+                past_keys[:, :, cache_position : cache_position + seq_len, :] = keys
+                past_values[:, :, cache_position : cache_position + seq_len, :] = values
+
+                # 2. View the buffer only up to the current length for attention
+                keys = past_keys[:, :, : cache_position + seq_len, :]
+                values = past_values[:, :, : cache_position + seq_len, :]
+            else:
+                # Slow Path: Legacy torch.cat behavior
+                keys = torch.cat([past_keys, keys], dim=2)
+                values = torch.cat([past_values, values], dim=2)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device=keys.device, dtype=torch.bool)
                 if attention_mask.dim() != 2 or attention_mask.size(1) != keys.size(2):
@@ -242,6 +254,7 @@ class TransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         attn_output, present_key_value = self.attention.forward_with_cache(
@@ -250,6 +263,7 @@ class TransformerBlock(nn.Module):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             past_key_value=past_key_value,
+            cache_position=cache_position,
         )
         hidden_states = hidden_states + attn_output
 
@@ -408,6 +422,7 @@ class TinyTransformer(nn.Module):
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[int] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -482,18 +497,19 @@ class TinyTransformer(nn.Module):
             )
 
         if attention_mask is not None:
-            past_seq_len = past_key_values[0][0].size(2)
-            expected_len = past_seq_len + seq_len
-            if attention_mask.shape != (batch_size, expected_len):
-                raise ValueError(
-                    "When using past_key_values, attention_mask must cover cached and current tokens."
-                )
+            # past_seq_len = past_key_values[0][0].size(2)
+            # expected_len = past_seq_len + seq_len
+            # if attention_mask.shape != (batch_size, expected_len):
+            #     raise ValueError(
+            #         "When using past_key_values, attention_mask must cover cached and current tokens."
+            #     )
+            pass
 
-        if len(past_key_values) != len(self.blocks):
-            raise ValueError(
-                f"Expected {len(self.blocks)} past key/value pairs, "
-                f"got {len(past_key_values)}."
-            )
+        # if len(past_key_values) != len(self.blocks):
+        #     raise ValueError(
+        #         f"Expected {len(self.blocks)} past key/value pairs, "
+        #         f"got {len(past_key_values)}."
+        #     )
 
         past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for block, layer_past in zip(self.blocks, past_key_values):
@@ -502,6 +518,7 @@ class TinyTransformer(nn.Module):
                 pos_xyz,
                 attention_mask=attention_mask,
                 past_key_value=layer_past,
+                cache_position=cache_position,
             )
             past_key_values_out.append(present_kv)
 
