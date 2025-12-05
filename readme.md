@@ -1,8 +1,8 @@
-***In progress, expect improvements***
+***In progress, I expect improvements till 30%***
 # 10% on ARC-1 with a 1M transformer
 
----
-### Self supervised compression on ARC
+
+## Self supervised compression on ARC
 
 Every DL approach on ARC today trains a supervised algorithm
 
@@ -12,8 +12,10 @@ A self-supervised compression step will obviously perform better:
 - Test grids have distribution shifts. Compression will push these grids into distribution
 
 ---
+
+## Details
 Performance - 10% on ARC-1 public eval
-Total compute cost - $0.709
+Total compute cost - **$0.709**
 - 52m of A100 for training (0.7$)
 - 40s of A100 for inference (0.009$)
 
