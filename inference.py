@@ -1,7 +1,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from tinytransformer import TinyTransformer
@@ -10,6 +10,8 @@ from utils import (
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
     START_TOKEN_ID,
+    apply_color_permutation_to_grid,
+    apply_color_permutation_to_tokens,
     compute_positions_3d,
     extract_output_tokens,
     grid_to_tokens,
@@ -306,6 +308,8 @@ def _prepare_examples_for_inference(
     examples: Sequence[object],
     include_targets: bool = False,
     solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
+    color_mapping: Optional[Sequence[int]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[
     List[List[int]],
     List[int],
@@ -322,7 +326,16 @@ def _prepare_examples_for_inference(
     for ex in examples:
         if not hasattr(ex, "tokens"):
             raise ValueError("Examples must provide a 'tokens' attribute.")
-        tokens = ex.tokens.tolist()
+        raw_tokens = ex.tokens.tolist()
+        split = getattr(ex, "split", None)
+        should_color = color_mapping is not None and (
+            color_apply_fn is None or color_apply_fn(split)
+        )
+        tokens = (
+            apply_color_permutation_to_tokens(raw_tokens, color_mapping)
+            if should_color
+            else raw_tokens
+        )
         prompt_tokens = _build_prompt_from_tokens(tokens)
         prompts.append(prompt_tokens)
         example_ids.append(int(getattr(ex, "example_id", 0)))
@@ -338,7 +351,12 @@ def _prepare_examples_for_inference(
         elif include_targets and solutions is not None:
             key = (getattr(ex, "task_id", None), getattr(ex, "pair_index", None))
             if key in solutions and solutions[key] is not None:
-                targets = grid_to_tokens(solutions[key])
+                target_grid = solutions[key]
+                if should_color:
+                    target_grid = apply_color_permutation_to_grid(
+                        target_grid, color_mapping
+                    )
+                targets = grid_to_tokens(target_grid)
         target_tokens.append(targets)
         metadata.append(
             {
@@ -564,6 +582,8 @@ def run_split_inference(
     pair_index: Optional[int] = None,
     log_prompts: bool = False,
     include_targets: bool = True,
+    color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> List[Dict[str, object]]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
     examples = _gather_examples_for_split(
@@ -577,43 +597,61 @@ def run_split_inference(
     if not examples:
         return []
 
-    # Sort by sequence length to keep padding overhead low, then restore order.
-    indexed_examples = list(enumerate(examples))
-    indexed_examples.sort(key=lambda pair: pair[1].seq_len, reverse=True)
-    results_buffer: List[Optional[Dict[str, object]]] = [None] * len(examples)
+    color_variants: List[Optional[Sequence[int]]] = (
+        list(color_mappings) if color_mappings is not None else [None]
+    )
+    all_results: List[Dict[str, object]] = []
 
-    for start in range(0, len(indexed_examples), batch_size):
-        chunk = indexed_examples[start : start + batch_size]
-        batch_indices, batch_examples = zip(*chunk)
-        (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
-            _prepare_examples_for_inference(
-                batch_examples, include_targets=include_targets, solutions=solutions
+    for color_idx, color_mapping in enumerate(color_variants):
+        # Sort by sequence length to keep padding overhead low, then restore order.
+        indexed_examples = list(enumerate(examples))
+        indexed_examples.sort(key=lambda pair: pair[1].seq_len, reverse=True)
+        results_buffer: List[Optional[Dict[str, object]]] = [None] * len(examples)
+
+        for start in range(0, len(indexed_examples), batch_size):
+            chunk = indexed_examples[start : start + batch_size]
+            batch_indices, batch_examples = zip(*chunk)
+            (
+                prompts,
+                example_ids,
+                metadata,
+                cached_positions,
+                target_output_tokens,
+            ) = _prepare_examples_for_inference(
+                batch_examples,
+                include_targets=include_targets,
+                solutions=solutions,
+                color_mapping=color_mapping,
+                color_apply_fn=color_apply_fn,
             )
-        )
-        if log_prompts:
-            for meta, prompt in zip(metadata, prompts):
-                print(
-                    "[prompt]",
-                    f"split={meta.get('split')}",
-                    f"task={meta.get('task_id')}",
-                    f"pair={meta.get('pair_index')}",
-                    "::",
-                    tokens_to_string(prompt),
-                )
-        batch_results = _run_generation_batch(
-            model=model,
-            prompts=prompts,
-            example_ids=example_ids,
-            metadata=metadata,
-            cached_positions=cached_positions,
-            device=device,
-            max_new_tokens=max_new_tokens,
-            target_output_tokens=target_output_tokens if include_targets else None,
-        )
-        for idx, res in zip(batch_indices, batch_results):
-            results_buffer[idx] = res
+            if log_prompts:
+                for meta, prompt in zip(metadata, prompts):
+                    print(
+                        "[prompt]",
+                        f"split={meta.get('split')}",
+                        f"task={meta.get('task_id')}",
+                        f"pair={meta.get('pair_index')}",
+                        "::",
+                        tokens_to_string(prompt),
+                    )
+            batch_results = _run_generation_batch(
+                model=model,
+                prompts=prompts,
+                example_ids=example_ids,
+                metadata=metadata,
+                cached_positions=cached_positions,
+                device=device,
+                max_new_tokens=max_new_tokens,
+                target_output_tokens=target_output_tokens if include_targets else None,
+            )
+            for idx, res in zip(batch_indices, batch_results):
+                if color_mapping is not None:
+                    res["color_permutation_index"] = color_idx
+                results_buffer[idx] = res
 
-    return [res for res in results_buffer if res is not None]
+        all_results.extend(res for res in results_buffer if res is not None)
+
+    return all_results
 
 
 def _has_correct_shape(
@@ -695,6 +733,8 @@ def evaluate_model_on_dataset(
     batch_size: int = 16,
     splits: Sequence[str] = ("train", "test"),
     log_prompts: bool = False,
+    color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Dict[str, object]]:
     evaluation: Dict[str, Dict[str, object]] = {}
     for split in splits:
@@ -707,6 +747,8 @@ def evaluate_model_on_dataset(
             max_new_tokens=max_new_tokens,
             log_prompts=log_prompts,
             include_targets=True,
+            color_mappings=color_mappings,
+            color_apply_fn=color_apply_fn,
         )
         summary = summarize_split_results(split_results)
         evaluation[split] = {"results": split_results, "summary": summary}

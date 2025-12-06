@@ -1,8 +1,11 @@
 import json
 import random
+import math
+import functools
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -34,6 +37,95 @@ END_TOKEN_ID = TOKEN_TO_ID["<end>"]
 
 MAX_SEQ_LEN = 1863
 IGNORE_INDEX = -100
+
+
+def generate_color_permutations(
+    max_permutations: int, seed: int
+) -> List[Tuple[int, ...]]:
+    """Return up to `max_permutations` unique shuffles of colors 1-9."""
+    if max_permutations <= 0:
+        return []
+    rng = random.Random(seed)
+    digits = list(range(1, 10))
+    permutations: List[Tuple[int, ...]] = []
+    seen = set()
+    limit = math.factorial(9)
+    target = min(max_permutations, limit)
+    if target == limit:
+        permutations = list(itertools.permutations(digits))
+        rng.shuffle(permutations)
+        return permutations
+    while len(permutations) < target:
+        perm = tuple(rng.sample(digits, len(digits)))
+        if perm in seen:
+            continue
+        seen.add(perm)
+        permutations.append(perm)
+    return permutations
+
+
+def color_permutation_to_mapping(perm: Sequence[int]) -> torch.Tensor:
+    """Build a token-id mapping tensor for a specific color permutation."""
+    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
+    mapping[1:10] = torch.tensor(list(perm), dtype=torch.long)
+    return mapping
+
+
+def generate_color_mapping_tensors(
+    max_permutations: int, seed: int
+) -> List[torch.Tensor]:
+    perms = generate_color_permutations(max_permutations, seed)
+    return [color_permutation_to_mapping(perm) for perm in perms]
+
+
+def apply_color_permutation_to_tokens(
+    tokens: Sequence[int], mapping: Sequence[int]
+) -> List[int]:
+    """Apply a color permutation mapping to a token list (keeps specials/0 fixed)."""
+    return [int(mapping[tok] if 0 <= tok < len(mapping) else tok) for tok in tokens]
+
+
+def apply_color_permutation_to_grid(
+    grid: Sequence[Sequence[int]], mapping: Sequence[int]
+) -> List[List[int]]:
+    return [
+        [int(mapping[val] if 0 <= val < len(mapping) else val) for val in row]
+        for row in grid
+    ]
+
+
+class ColorAugmentor:
+    """Holds a deterministic list of color mappings and exposes epoch-based selection."""
+
+    def __init__(
+        self, mappings: Sequence[torch.Tensor], apply_to_test_split: bool = False
+    ) -> None:
+        self.mappings = list(mappings)
+        self.apply_to_test_split = apply_to_test_split
+        self._index = 0
+
+    @property
+    def num_permutations(self) -> int:
+        return len(self.mappings)
+
+    @property
+    def current_index(self) -> int:
+        if self.num_permutations == 0:
+            return 0
+        return self._index % self.num_permutations
+
+    def set_index(self, index: int) -> None:
+        if self.num_permutations == 0:
+            return
+        self._index = max(0, int(index))
+
+    def mapping_for_split(self, split: str) -> Optional[torch.Tensor]:
+        if not self.mappings:
+            return None
+        if split == "test" and not self.apply_to_test_split:
+            return None
+        idx = self._index % self.num_permutations
+        return self.mappings[idx]
 
 
 def _value_to_token_id(value: int) -> int:
@@ -389,7 +481,7 @@ def run_aaivr_on_results(
     discard_input_copies: bool = True,
     rng: Optional[random.Random] = None,
 ) -> List[AAIVRSelection]:
-    """Aggregate augmented predictions via AAIVR voting.
+    """Aggregate augmented predictions via AAIVR voting. (automated augmentation inverse)
 
     The function assumes pair_index encodes augmentation order (mod 8). It
     returns up to `top_k` most common inverse-transformed outputs per
@@ -453,7 +545,9 @@ def run_aaivr_on_results(
             normalized_target = apply_inverse_dihedral_transform(
                 target_grid, transform_index
             )
-            stats["target_grid"] = normalized_target if is_rectangular_grid(normalized_target) else None
+            stats["target_grid"] = (
+                normalized_target if is_rectangular_grid(normalized_target) else None
+            )
 
     selections: List[AAIVRSelection] = []
     for (task_id, base_idx), stats in sorted(case_map.items()):
@@ -753,7 +847,9 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
 
 
 def collate_examples(
-    batch: List[SequenceExample], pad_token_id: int = END_TOKEN_ID
+    batch: List[SequenceExample],
+    pad_token_id: int = END_TOKEN_ID,
+    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
@@ -768,7 +864,12 @@ def collate_examples(
 
     for idx, example in enumerate(batch):
         seq_len = example.seq_len
-        input_ids[idx, :seq_len] = example.tokens
+        tokens = example.tokens
+        if color_mapper is not None:
+            mapping = color_mapper(example.split)
+            if mapping is not None:
+                tokens = mapping[tokens]
+        input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
         positions_3d[idx, :seq_len] = example.cached_positions
@@ -792,6 +893,7 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
+    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
@@ -801,9 +903,14 @@ def create_dataloader(
     batch_sampler = LengthBucketBatchSampler(
         lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
+    collate_fn = (
+        functools.partial(collate_examples, color_mapper=color_mapper)
+        if color_mapper is not None
+        else collate_examples
+    )
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=collate_examples,
+        collate_fn=collate_fn,
     )

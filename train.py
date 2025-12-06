@@ -10,7 +10,14 @@ from torch.optim import AdamW
 import numpy as np
 
 from tinytransformer import TinyTransformer, TinyTransformerConfig
-from utils import ARCExampleDataset, MAX_SEQ_LEN, create_dataloader, tokens_to_string
+from utils import (
+    ARCExampleDataset,
+    MAX_SEQ_LEN,
+    ColorAugmentor,
+    create_dataloader,
+    generate_color_mapping_tensors,
+    tokens_to_string,
+)
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
@@ -96,6 +103,27 @@ def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) ->
             pass
 
 
+def _build_color_augmentor(
+    args: argparse.Namespace, is_eval: bool
+) -> Optional[ColorAugmentor]:
+    flag_name = "enable_color_aug_eval" if is_eval else "enable_color_aug_train"
+    max_name = "max_color_augments_eval" if is_eval else "max_color_augments_train"
+    enabled = bool(getattr(args, flag_name, False))
+    max_augments = int(getattr(args, max_name, 0) or 0)
+    if not enabled or max_augments <= 0:
+        return None
+    seed = getattr(args, "color_aug_seed", None)
+    if seed is None:
+        seed = args.seed
+    seed = int(seed)
+    mappings = generate_color_mapping_tensors(max_augments, seed)
+    if not mappings:
+        return None
+    return ColorAugmentor(
+        mappings=mappings, apply_to_test_split=True if is_eval else False
+    )
+
+
 def train_one_epoch(
     model: TinyTransformer,
     dataloader: torch.utils.data.DataLoader,
@@ -113,6 +141,8 @@ def train_one_epoch(
     total_input_loss = 0.0
     total_output_loss = 0.0
     logged = 0
+    color_augmentor = getattr(dataloader, "color_augmentor", None)
+    color_aug_in_collate = bool(getattr(dataloader, "color_aug_in_collate", False))
     for batch in dataloader:
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
@@ -120,6 +150,25 @@ def train_one_epoch(
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
+        if (
+            color_augmentor is not None
+            and not color_aug_in_collate
+            and color_augmentor.num_permutations > 0
+        ):
+            splits = batch.get("splits")
+            if splits:
+                mapping_cache: Dict[str, Optional[torch.Tensor]] = {}
+                for i, split in enumerate(splits):
+                    if split not in mapping_cache:
+                        mapping = color_augmentor.mapping_for_split(split)
+                        mapping_cache[split] = (
+                            mapping.to(device) if mapping is not None else None
+                        )
+                    mapping = mapping_cache[split]
+                    if mapping is None:
+                        continue
+                    seq_len = int(attention_mask[i].sum().item())
+                    input_ids[i, :seq_len] = mapping[input_ids[i, :seq_len]]
 
         outputs = model(
             input_ids,
@@ -268,6 +317,7 @@ def build_model_and_data(
     args: argparse.Namespace,
     checkpoint: Optional[Dict[str, Any]] = None,
     reuse_dataset: Optional[ARCExampleDataset] = None,
+    is_eval: bool = False,
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -311,13 +361,27 @@ def build_model_and_data(
             task_whitelist=task_whitelist,
         )
 
+    color_augmentor = _build_color_augmentor(args, is_eval=is_eval)
+    if color_augmentor is not None:
+        dataset.color_permutation_mappings = color_augmentor.mappings
+        dataset.color_aug_apply_to_test = color_augmentor.apply_to_test_split
+
     # We always recreate the dataloader because batch_size might have changed in args
+    collate_color_mapper = (
+        color_augmentor.mapping_for_split
+        if color_augmentor is not None and getattr(args, "num_workers", 0) == 0
+        else None
+    )
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
         num_workers=args.num_workers,
+        color_mapper=collate_color_mapper,
     )
+    if color_augmentor is not None:
+        dataloader.color_augmentor = color_augmentor
+        dataloader.color_aug_in_collate = collate_color_mapper is not None
 
     if (
         checkpoint_num_examples is not None
@@ -467,8 +531,16 @@ def train_model(
     else:
         training_model = model
 
+    color_augmentor = getattr(dataloader, "color_augmentor", None)
+
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
+        if color_augmentor is not None and color_augmentor.num_permutations > 0:
+            color_augmentor.set_index(epoch)
+            print(
+                f"Using color permutation {color_augmentor.current_index + 1}"
+                f"/{color_augmentor.num_permutations} for this epoch."
+            )
 
         # Run Training
         step = train_one_epoch(

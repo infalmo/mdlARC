@@ -60,13 +60,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="During single-example inference, plot input/output grids.",
     )
+    parser.add_argument(
+        "--enable-color-aug-train",
+        action="store_true",
+        help="Apply color permutations during training (train split only).",
+    )
+    parser.add_argument(
+        "--max-color-augments-train",
+        type=int,
+        default=0,
+        help="Max number of unique color permutations to cycle through during training.",
+    )
+    parser.add_argument(
+        "--enable-color-aug-eval",
+        action="store_true",
+        help="Apply color permutations during evaluation/inference.",
+    )
+    parser.add_argument(
+        "--max-color-augments-eval",
+        type=int,
+        default=0,
+        help="Number of color permutations to run at evaluation time.",
+    )
+    parser.add_argument(
+        "--color-aug-seed",
+        type=int,
+        default=None,
+        help="Optional seed for color permutations (defaults to --seed).",
+    )
     return parser.parse_args()
 
 
 def run(args: argparse.Namespace) -> None:
     checkpoint = load_checkpoint(args.checkpoint_path)
     model, dataset, dataloader, device, data_path = build_model_and_data(
-        args, checkpoint=checkpoint
+        args, checkpoint=checkpoint, is_eval=args.eval_only
     )
 
     if not args.eval_only:
