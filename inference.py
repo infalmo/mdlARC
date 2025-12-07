@@ -21,54 +21,210 @@ from utils import (
 DEFAULT_MAX_NEW_TOKENS = 931
 
 
-class BatchGridState:
-    """Vectorized tracker for 3D grid coordinates during generation."""
+# 1. COMPILED HELPER FOR GRID LOGIC
+@torch.compile(mode="reduce-overhead", fullgraph=True)
+def _compiled_grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
+    x, y, z = state.unbind(-1)
 
+    pos_x = torch.clamp(x, min=0, max=30)
+    pos_y = torch.clamp(y, min=0, max=29)
+    pos_z = z
+
+    is_start = token_ids == start_id
+    is_sep = token_ids == sep_id
+    is_end = token_ids == end_id
+    is_newline = token_ids == nl_id
+
+    zeros = torch.zeros_like(x)
+    pos_x = torch.where(is_start | is_sep | is_end, zeros, pos_x)
+    pos_y = torch.where(is_start | is_sep | is_end, zeros, pos_y)
+    pos_z = torch.where(is_start, zeros, pos_z)
+    pos_z = torch.where(is_sep, torch.full_like(pos_z, 2), pos_z)
+    pos_z = torch.where(is_end, torch.full_like(pos_z, 4), pos_z)
+
+    next_x = x + 1
+    next_y = y
+    next_z = z
+
+    next_x = torch.where(is_newline, zeros, next_x)
+    next_y = torch.where(is_newline, y + 1, next_y)
+    next_x = torch.where(is_sep, zeros, next_x)
+    next_y = torch.where(is_sep, zeros, next_y)
+    next_z = torch.where(is_sep, torch.full_like(next_z, 3), next_z)
+    next_x = torch.where(is_end | is_start, x, next_x)
+    next_y = torch.where(is_end | is_start, y, next_y)
+    next_z = torch.where(is_start, z, next_z)
+    next_z = torch.where(is_end, z, next_z)
+
+    return torch.stack([next_x, next_y, next_z], dim=-1), torch.stack(
+        [pos_x, pos_y, pos_z], dim=-1
+    )
+
+
+class BatchGridState:
     def __init__(self, initial_state: torch.Tensor) -> None:
-        if initial_state.dim() != 2 or initial_state.size(1) != 3:
-            raise ValueError("initial_state must have shape [batch, 3].")
         self.state = initial_state.clone().long()
 
     def update(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Advance state with a batch of token ids and return positions for them."""
         token_ids = token_ids.view(-1).to(device=self.state.device)
-        x, y, z = self.state.unbind(-1)
-
-        pos_x = torch.clamp(x, min=0, max=30)
-        pos_y = torch.clamp(y, min=0, max=29)
-        pos_z = z
-
-        is_start = token_ids == START_TOKEN_ID
-        is_sep = token_ids == IO_SEPARATOR_TOKEN_ID
-        is_end = token_ids == END_TOKEN_ID
-        is_newline = token_ids == NEXT_LINE_TOKEN_ID
-
-        zeros = torch.zeros_like(x)
-        pos_x = torch.where(is_start | is_sep | is_end, zeros, pos_x)
-        pos_y = torch.where(is_start | is_sep | is_end, zeros, pos_y)
-        pos_z = torch.where(is_start, zeros, pos_z)
-        pos_z = torch.where(is_sep, torch.full_like(pos_z, 2), pos_z)
-        pos_z = torch.where(is_end, torch.full_like(pos_z, 4), pos_z)
-
-        next_x = x + 1
-        next_y = y
-        next_z = z
-
-        next_x = torch.where(is_newline, zeros, next_x)
-        next_y = torch.where(is_newline, y + 1, next_y)
-
-        next_x = torch.where(is_sep, zeros, next_x)
-        next_y = torch.where(is_sep, zeros, next_y)
-        next_z = torch.where(is_sep, torch.full_like(next_z, 3), next_z)
-
-        next_x = torch.where(is_end | is_start, x, next_x)
-        next_y = torch.where(is_end | is_start, y, next_y)
-        next_z = torch.where(is_start, z, next_z)
-        next_z = torch.where(is_end, z, next_z)
-
-        self.state = torch.stack([next_x, next_y, next_z], dim=-1)
-        positions = torch.stack([pos_x, pos_y, pos_z], dim=-1)
+        self.state, positions = _compiled_grid_update(
+            self.state,
+            token_ids,
+            START_TOKEN_ID,
+            IO_SEPARATOR_TOKEN_ID,
+            END_TOKEN_ID,
+            NEXT_LINE_TOKEN_ID,
+        )
         return positions
+
+
+@torch.inference_mode()
+def batched_greedy_generate(
+    model, prompts, example_ids, device, max_new_tokens=931, cached_positions=None
+):
+    model.eval()
+    batch_size = len(prompts)
+    max_model_len = model.config.max_seq_len
+
+    # --- Setup Inputs ---
+    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
+    # _left_pad_sequences and _pad_cached_positions from your original code...
+    # Assuming they are available in scope or imported
+    input_ids, attention_mask = _left_pad_sequences(prompts, END_TOKEN_ID, device)
+
+    # Pre-calculate 3D positions for prompt
+    if cached_positions and all(p is not None for p in cached_positions):
+        prompt_positions = _pad_cached_positions(
+            [p for p in cached_positions if p is not None], input_ids.size(1), device
+        )
+    else:
+        prompt_positions = compute_positions_3d(input_ids, attention_mask).to(
+            device=device, dtype=torch.long
+        )
+
+    # Calculate initial grid state
+    from inference import _derive_initial_state_from_prompt  # Import or paste logic
+
+    initial_state, finished = _derive_initial_state_from_prompt(
+        input_ids, prompt_positions, attention_mask
+    )
+    grid_state = BatchGridState(initial_state)
+
+    example_embeds = model.example_embedding(example_ids_tensor)
+    current_len = input_ids.size(1)
+
+    # --- 1. PROMPT PASS (Fill Cache) ---
+    # We create a FULL SIZED mask: [B, MaxLen]
+    # We set future positions to False
+    full_attention_mask = torch.zeros(
+        (batch_size, max_model_len), dtype=torch.bool, device=device
+    )
+    full_attention_mask[:, :current_len] = attention_mask
+
+    # Prompt pass uses the sliced view for computation, but returns KV cache we will size up
+    outputs = model.forward_generate(
+        input_ids=input_ids,
+        example_ids=example_ids_tensor,
+        past_key_values=None,
+        positions_3d=prompt_positions,
+        attention_mask=attention_mask,  # Prompt pass uses tight mask
+        example_embeds=example_embeds,
+    )
+    logits = outputs["logits"]
+    prompt_kvs = outputs["past_key_values"]
+
+    # --- 2. SETUP STATIC KV CACHE ---
+    # Convert the prompt KVs into a fixed size buffer [B, H, MaxLen, D]
+    past_key_values = []
+    for k, v in prompt_kvs:
+        # k, v are [B, H, PromptLen, D]
+        B, H, L, D = k.shape
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=k.dtype, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=v.dtype, device=device)
+        k_buf[:, :, :L, :] = k
+        v_buf[:, :, :L, :] = v
+        past_key_values.append((k_buf, v_buf))
+    past_key_values = tuple(past_key_values)
+
+    # --- 3. COMPILE GENERATION STEP ---
+    # We compile the forward pass specifically for the decoding step
+    if not hasattr(model, "_compiled_decode"):
+        print("Compiling model for decoding step...")
+        # Reduce-overhead works best with purely static shapes
+        model._compiled_decode = torch.compile(
+            model.forward_generate, mode="reduce-overhead", fullgraph=True
+        )
+
+    # --- 4. GENERATION LOOP ---
+    cache_position = torch.tensor([current_len], dtype=torch.long, device=device)
+    steps_remaining = min(max_new_tokens, max_model_len - current_len)
+
+    # Output buffer
+    generated_tokens_buffer = torch.full(
+        (batch_size, steps_remaining), END_TOKEN_ID, dtype=torch.long, device=device
+    )
+
+    # Loop over steps
+    # We use a Python loop, but the heavy lifting is inside the compiled regions
+    for step_i in range(steps_remaining):
+        if finished.all():
+            break
+
+        # Greedy decode
+        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        next_token = torch.where(
+            finished, torch.tensor(END_TOKEN_ID, device=device), next_token
+        )
+
+        # Save token
+        generated_tokens_buffer[:, step_i] = next_token
+
+        # Update finished status
+        finished = finished | (next_token == END_TOKEN_ID)
+
+        # Update Grid (Compiled)
+        token_positions = grid_state.update(next_token).unsqueeze(1)
+
+        # Update Mask (In-place on the full buffer)
+        # Note: In static graph world, we pass the WHOLE mask.
+        # We update the mask bit for the current position.
+        full_attention_mask.index_fill_(1, cache_position, True)
+        # However, we must ensure we handle finished sequences.
+        # Actually, if we just keep attending to padding (END tokens), it's fine for shape consistency.
+        # Ideally, we mask out finished ones, but for batching we usually just let them generate padding.
+        # Specifically: The mask must be True for the *new* token index.
+        # Since we use index_fill with a scalar tensor, it sets that column to True for ALL batch items.
+        # This is acceptable for simple batching; masking finished rows is handled by "finished" logic.
+
+        # Run Model (Compiled)
+        # Note: We pass the FULL STATIC mask. No slicing.
+        # We pass the cache_position as a TENSOR.
+        outputs = model._compiled_decode(
+            input_ids=next_token.unsqueeze(1),
+            example_ids=example_ids_tensor,
+            past_key_values=past_key_values,  # Fixed tuple of fixed buffers
+            positions_3d=token_positions,
+            attention_mask=full_attention_mask,  # Full [B, MaxLen]
+            cache_position=cache_position,  # Tensor(1)
+            example_embeds=example_embeds,
+        )
+        logits = outputs["logits"]
+
+        # Increment position
+        cache_position.add_(1)
+
+    # --- 5. FINALIZE ---
+    # (Existing code to convert buffer to lists)
+    generated_cpu = generated_tokens_buffer.tolist()
+    results = []
+    for i, prompt in enumerate(prompts):
+        gen_seq = []
+        for token in generated_cpu[i]:
+            gen_seq.append(token)
+            if token == END_TOKEN_ID:
+                break
+        results.append(list(prompt) + gen_seq)
+    return results
 
 
 def _left_pad_sequences(
@@ -145,153 +301,6 @@ def _derive_initial_state_from_prompt(
     initial_state = torch.stack([next_x, next_y, next_z], dim=-1)
     finished = last_tokens == END_TOKEN_ID
     return initial_state, finished
-
-
-@torch.inference_mode()
-def batched_greedy_generate(
-    model: TinyTransformer,
-    prompts: Sequence[Sequence[int]],
-    example_ids: Sequence[int],
-    device: torch.device,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    cached_positions: Optional[Sequence[Optional[torch.Tensor]]] = None,
-) -> List[List[int]]:
-    if not prompts:
-        raise ValueError("prompts must be non-empty.")
-    if len(prompts) != len(example_ids):
-        raise ValueError("prompts and example_ids must have the same length.")
-    if cached_positions is not None and len(cached_positions) != len(prompts):
-        raise ValueError(
-            "cached_positions must be None or match the number of prompts."
-        )
-
-    model.eval()
-    batch_size = len(prompts)
-    max_prompt_len = max(len(seq) for seq in prompts)
-    if max_prompt_len > model.config.max_seq_len:
-        raise ValueError("Prompt length exceeds model max_seq_len; cannot generate.")
-
-    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
-    input_ids, attention_mask = _left_pad_sequences(
-        prompts, pad_token_id=END_TOKEN_ID, device=device
-    )
-
-    use_cached_positions = cached_positions is not None and all(
-        pos is not None for pos in cached_positions
-    )
-
-    if use_cached_positions:
-        prompt_positions = _pad_cached_positions(
-            [pos for pos in cached_positions if pos is not None],
-            max_prompt_len,
-            device=device,
-        )
-    else:
-        prompt_positions = compute_positions_3d(input_ids, attention_mask).to(
-            device=device, dtype=torch.long
-        )
-
-    example_embeds = model.example_embedding(example_ids_tensor)
-    initial_state, finished = _derive_initial_state_from_prompt(
-        input_ids, prompt_positions, attention_mask
-    )
-    grid_state = BatchGridState(initial_state)
-    current_len = input_ids.size(1)
-    max_len = model.config.max_seq_len
-
-    # 1. Initial Prompt Pass
-    running_attention_mask = torch.zeros(
-        (batch_size, max_len), dtype=torch.bool, device=device
-    )
-    running_attention_mask[:, :current_len] = attention_mask
-    prompt_attention_mask = running_attention_mask[:, :current_len]
-    outputs = model.forward_generate(
-        input_ids=input_ids,
-        example_ids=example_ids_tensor,
-        past_key_values=None,
-        positions_3d=prompt_positions,
-        attention_mask=prompt_attention_mask,
-        example_embeds=example_embeds,
-    )
-    logits = outputs["logits"]
-    prompt_past_key_values = outputs["past_key_values"]
-
-    # 2. Pre-allocate KV Cache
-    # We create a buffer of (Batch, Heads, MaxSeqLen, Dim) and copy the prompt KV into it.
-    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    for k, v in prompt_past_key_values:
-        # k, v are [Batch, Heads, PromptLen, Dim]
-        # create buffer
-        B, H, L, D = k.shape
-        k_buffer = torch.zeros((B, H, max_len, D), dtype=k.dtype, device=k.device)
-        v_buffer = torch.zeros((B, H, max_len, D), dtype=v.dtype, device=v.device)
-
-        # Copy prompt data
-        k_buffer[:, :, :L, :] = k
-        v_buffer[:, :, :L, :] = v
-        past_key_values.append((k_buffer, v_buffer))
-
-    past_key_values = tuple(past_key_values)
-    cache_position = current_len  # We start generating at this index
-
-    max_steps_allowed = max(model.config.max_seq_len - input_ids.size(1), 0)
-    steps_remaining = min(max_new_tokens, max_steps_allowed)
-
-    # Instead of appending to python lists (CPU) every step, we write to this tensor.
-    generated_tokens_buffer = torch.full(
-        (batch_size, steps_remaining), END_TOKEN_ID, dtype=torch.long, device=device
-    )
-
-    if steps_remaining <= 0 or finished.all():
-        return [list(seq) for seq in prompts]
-
-    steps = 0
-    while steps < steps_remaining and not finished.all():
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
-        next_token = torch.where(
-            finished, torch.full_like(next_token, END_TOKEN_ID), next_token
-        )
-
-        should_append = ~finished
-        token_positions = grid_state.update(next_token).unsqueeze(1)
-
-        # Write to GPU buffer directly. No .item(), no .tolist(), no CPU sync.
-        generated_tokens_buffer[:, steps] = next_token
-
-        finished = finished | (next_token == END_TOKEN_ID)
-
-        running_attention_mask[:, cache_position] = should_append
-        attn_mask_view = running_attention_mask[:, : cache_position + 1]
-
-        outputs = model.forward_generate(
-            input_ids=next_token.unsqueeze(1),
-            example_ids=example_ids_tensor,
-            past_key_values=past_key_values,
-            positions_3d=token_positions,
-            attention_mask=attn_mask_view,
-            cache_position=cache_position,
-            example_embeds=example_embeds,
-        )
-        logits = outputs["logits"]
-        # past_key_values = outputs["past_key_values"]
-
-        steps += 1
-        cache_position += 1
-
-    generated_cpu = generated_tokens_buffer[:, :steps].tolist()
-
-    results = []
-    for i, prompt in enumerate(prompts):
-        gen_seq = []
-        # Extract valid tokens until the first END_TOKEN_ID
-        for token in generated_cpu[i]:
-            gen_seq.append(token)
-            if token == END_TOKEN_ID:
-                break
-        results.append(list(prompt) + gen_seq)
-
-    return results
 
 
 def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:

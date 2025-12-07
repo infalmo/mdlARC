@@ -118,7 +118,7 @@ class MultiHeadSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        cache_position: Optional[int] = None,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -130,29 +130,42 @@ class MultiHeadSelfAttention(nn.Module):
         if pos_xyz is not None:
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
-        if attention_mask is not None:
-            if (
-                attention_mask.device != queries.device
-                or attention_mask.dtype != torch.bool
-            ):
-                attention_mask = attention_mask.to(
-                    device=queries.device, dtype=torch.bool
-                )
+        # if attention_mask is not None:
+        #     if attention_mask.device != queries.device or attention_mask.dtype != torch.bool:
+        #         attention_mask = attention_mask.to(device=queries.device, dtype=torch.bool)
 
         # --- Incremental Decoding (KV Cache) ---
         if past_key_value is not None:
             past_keys, past_values = past_key_value
             if cache_position is not None:
                 # Optimized Path: In-place update
-                past_keys[:, :, cache_position : cache_position + seq_len, :] = keys
-                past_values[:, :, cache_position : cache_position + seq_len, :] = values
-                keys = past_keys[:, :, : cache_position + seq_len, :]
-                values = past_values[:, :, : cache_position + seq_len, :]
+                # We use .index_copy_ or simple indexing with the tensor position
+                # Note: cache_position should be a tensor of shape (1,) or scalar tensor
+
+                # Update the buffer at the specific position
+                # We must use proper indexing for the specific token slot
+                # keys is [B, H, 1, D] during generation
+                # past_keys.index_put_((torch.arange(batch_size, device=keys.device), slice(None), cache_position), keys.squeeze(2))
+                # past_values.index_put_((torch.arange(batch_size, device=values.device), slice(None), cache_position), values.squeeze(2))
+
+                # Ensure cache_position is 1D for index_copy_
+                if cache_position.dim() == 0:
+                    idx = cache_position.view(1)
+                else:
+                    idx = cache_position
+
+                past_keys.index_copy_(2, idx, keys)
+                past_values.index_copy_(2, idx, values)
+
+                # CRITICAL FIX: Do NOT slice past_keys/values.
+                # Use the FULL buffer [B, H, MaxLen, D].
+                # The attention_mask will hide the garbage data in future slots.
+                keys = past_keys
+                values = past_values
             else:
-                # Legacy Path
+                # Legacy path (should not be hit in optimized inference)
                 keys = torch.cat([past_keys, keys], dim=2)
                 values = torch.cat([past_values, values], dim=2)
-
             # Construct Mask for SDPA
             attn_bias = None
             if attention_mask is not None:
@@ -172,7 +185,7 @@ class MultiHeadSelfAttention(nn.Module):
                 keys,
                 values,
                 attn_mask=attn_bias,
-                dropout_p=self.dropout_p if self.training else 0.0,
+                dropout_p=0.0,
                 is_causal=False,
             )
 
@@ -266,7 +279,7 @@ class TransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        cache_position: Optional[int] = None,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         attn_output, present_key_value = self.attention.forward_with_cache(
@@ -435,7 +448,7 @@ class TinyTransformer(nn.Module):
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        cache_position: Optional[int] = None,
+        cache_position: Optional[torch.Tensor] = None,
         example_embeds: Optional[torch.Tensor] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
