@@ -123,8 +123,13 @@ class MultiHeadSelfAttention(nn.Module):
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
         if attention_mask is not None:
-            if attention_mask.device != queries.device or attention_mask.dtype != torch.bool:
-                attention_mask = attention_mask.to(device=queries.device, dtype=torch.bool)
+            if (
+                attention_mask.device != queries.device
+                or attention_mask.dtype != torch.bool
+            ):
+                attention_mask = attention_mask.to(
+                    device=queries.device, dtype=torch.bool
+                )
 
         # Incremental decoding branch: concatenate cached K/V and attend
         # from the new tokens only. No causal mask is needed because there
@@ -453,7 +458,9 @@ class TinyTransformer(nn.Module):
 
         if example_embeds is not None:
             if example_embeds.shape[0] != input_ids.size(0):
-                raise ValueError("example_embeds must have batch dimension matching input_ids.")
+                raise ValueError(
+                    "example_embeds must have batch dimension matching input_ids."
+                )
         else:
             example_embeds = self.example_embedding(example_ids)
 
@@ -548,10 +555,10 @@ class TinyTransformer(nn.Module):
 
 
 class RotaryEmbedding3D(nn.Module):
-    """3D Rotary Positional Embedding applied to Q/K.
+    """3D Rotary Positional Embedding applied to Q/K using precomputed lookups.
 
-    Splits head_dim into three even slices (x,y,z), applies standard RoPE to
-    each slice using the token's grid coordinate along that axis.
+    Splits head_dim into three even slices (x,y,z). Precomputes cos/sin tables
+    for fixed coordinate ranges (x:0-32, y:0-32, z:0-8) to speed up inference.
     """
 
     def __init__(self, head_dim: int, base: float = 10000.0) -> None:
@@ -569,22 +576,44 @@ class RotaryEmbedding3D(nn.Module):
         self.d_x = px * 2
         self.d_y = py * 2
         self.d_z = pz * 2
-        # Precompute inverse frequency for each axis slice
-        self.register_buffer(
-            "inv_freq_x", self._build_inv_freq(self.d_x), persistent=False
-        )
-        self.register_buffer(
-            "inv_freq_y", self._build_inv_freq(self.d_y), persistent=False
-        )
-        self.register_buffer(
-            "inv_freq_z", self._build_inv_freq(self.d_z), persistent=False
-        )
+
+        # Define bounds based on grid constraints (30x30 max, 5 z-levels).
+        # Using slightly higher powers-of-2-ish bounds for safety.
+        self.max_x = 32
+        self.max_y = 32
+        self.max_z = 8
+
+        # Precompute and register caches
+        self._register_cache("x", self.d_x, self.max_x)
+        self._register_cache("y", self.d_y, self.max_y)
+        self._register_cache("z", self.d_z, self.max_z)
 
     def _build_inv_freq(self, dim: int) -> torch.Tensor:
         if dim <= 0:
             return torch.empty(0)
-        # Standard RoPE frequency schedule
         return 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
+
+    def _register_cache(self, name: str, dim: int, max_pos: int) -> None:
+        if dim <= 0:
+            # Empty buffers for unused dimensions (keeps state_dict clean)
+            self.register_buffer(f"cos_{name}_cache", torch.empty(0), persistent=False)
+            self.register_buffer(f"sin_{name}_cache", torch.empty(0), persistent=False)
+            return
+
+        inv_freq = self._build_inv_freq(dim)
+        # Generate all possible positions [0, 1, ... max_pos-1]
+        pos = torch.arange(max_pos).float()
+
+        # Outer product: [max_pos, dim/2]
+        t = pos.unsqueeze(-1) * inv_freq
+
+        # Compute cos/sin and repeat_interleave to match [max_pos, dim]
+        # We do the interleave here once, so we don't do it at every forward step.
+        cos = torch.cos(t).repeat_interleave(2, dim=-1)
+        sin = torch.sin(t).repeat_interleave(2, dim=-1)
+
+        self.register_buffer(f"cos_{name}_cache", cos, persistent=False)
+        self.register_buffer(f"sin_{name}_cache", sin, persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -593,19 +622,6 @@ class RotaryEmbedding3D(nn.Module):
         x2 = x[..., 1::2]
         out = torch.stack((-x2, x1), dim=-1)
         return out.flatten(-2)
-
-    def _build_cos_sin(
-        self, pos: torch.Tensor, inv_freq: torch.Tensor, dim: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if dim == 0:
-            shape = (*pos.shape, 0)
-            zero = torch.zeros(shape, dtype=pos.dtype, device=pos.device)
-            return zero, zero
-        # pos: [B, S]; inv_freq: [dim/2]
-        t = pos.float().unsqueeze(-1) * inv_freq  # [B, S, dim/2]
-        cos = torch.cos(t).repeat_interleave(2, dim=-1)  # [B, S, dim]
-        sin = torch.sin(t).repeat_interleave(2, dim=-1)
-        return cos, sin
 
     def apply_rotary(
         self, q: torch.Tensor, k: torch.Tensor, pos_xyz: torch.Tensor
@@ -618,20 +634,11 @@ class RotaryEmbedding3D(nn.Module):
         B, H, S, D = q.shape
         assert D == self.head_dim
 
-        # Build cos/sin for each axis and broadcast over heads
-        pos_x = pos_xyz[..., 0]
-        pos_y = pos_xyz[..., 1]
-        pos_z = pos_xyz[..., 2]
-        cos_x, sin_x = self._build_cos_sin(pos_x, self.inv_freq_x, self.d_x)
-        cos_y, sin_y = self._build_cos_sin(pos_y, self.inv_freq_y, self.d_y)
-        cos_z, sin_z = self._build_cos_sin(pos_z, self.inv_freq_z, self.d_z)
-        # [B, 1, S, dim]
-        cos_x = cos_x.unsqueeze(1)
-        sin_x = sin_x.unsqueeze(1)
-        cos_y = cos_y.unsqueeze(1)
-        sin_y = sin_y.unsqueeze(1)
-        cos_z = cos_z.unsqueeze(1)
-        sin_z = sin_z.unsqueeze(1)
+        # Ensure indices are within bounds (clamping protects against out-of-bounds crash)
+        # pos_xyz is expected to be LongTensor suitable for indexing.
+        pos_x = pos_xyz[..., 0].clamp(0, self.max_x - 1)
+        pos_y = pos_xyz[..., 1].clamp(0, self.max_y - 1)
+        pos_z = pos_xyz[..., 2].clamp(0, self.max_z - 1)
 
         # Slices
         dx, dy, dz = self.d_x, self.d_y, self.d_z
@@ -643,13 +650,24 @@ class RotaryEmbedding3D(nn.Module):
         q_x, q_y, q_z = q[..., s0:s1], q[..., s1:s2], q[..., s2:s3]
         k_x, k_y, k_z = k[..., s0:s1], k[..., s1:s2], k[..., s2:s3]
 
+        # Apply rotations using cached lookups
+        # Shape: [B, S] -> Lookup [B, S, D_slice] -> Unsqueeze [B, 1, S, D_slice] (broadcast over heads)
+
         if dx > 0:
+            cos_x = self.cos_x_cache[pos_x].unsqueeze(1)
+            sin_x = self.sin_x_cache[pos_x].unsqueeze(1)
             q_x = q_x * cos_x + self._rotate_half(q_x) * sin_x
             k_x = k_x * cos_x + self._rotate_half(k_x) * sin_x
+
         if dy > 0:
+            cos_y = self.cos_y_cache[pos_y].unsqueeze(1)
+            sin_y = self.sin_y_cache[pos_y].unsqueeze(1)
             q_y = q_y * cos_y + self._rotate_half(q_y) * sin_y
             k_y = k_y * cos_y + self._rotate_half(k_y) * sin_y
+
         if dz > 0:
+            cos_z = self.cos_z_cache[pos_z].unsqueeze(1)
+            sin_z = self.sin_z_cache[pos_z].unsqueeze(1)
             q_z = q_z * cos_z + self._rotate_half(q_z) * sin_z
             k_z = k_z * cos_z + self._rotate_half(k_z) * sin_z
 
