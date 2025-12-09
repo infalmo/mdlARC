@@ -669,6 +669,7 @@ def evaluate_model_on_dataset(
     log_prompts: bool = False,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    task_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, object]]:
     evaluation: Dict[str, Dict[str, object]] = {}
     for split in splits:
@@ -683,6 +684,7 @@ def evaluate_model_on_dataset(
             include_targets=True,
             color_mappings=color_mappings,
             color_apply_fn=color_apply_fn,
+            task_ids=task_ids,
         )
         summary = summarize_split_results(split_results)
         evaluation[split] = {"results": split_results, "summary": summary}
