@@ -22,7 +22,7 @@ DEFAULT_MAX_NEW_TOKENS = 931
 
 
 # 1. COMPILED HELPER FOR GRID LOGIC
-@torch.compile(mode="reduce-overhead", fullgraph=True)
+@torch.compile(mode="default", fullgraph=True)
 def _compiled_grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
     x, y, z = state.unbind(-1)
 
@@ -88,13 +88,24 @@ def batched_greedy_generate(
     model.to(dtype=torch.bfloat16)
 
     batch_size = len(prompts)
-    max_model_len = model.config.max_seq_len
 
     # --- Setup Inputs ---
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
     # _left_pad_sequences and _pad_cached_positions from your original code...
     # Assuming they are available in scope or imported
     input_ids, attention_mask = _left_pad_sequences(prompts, END_TOKEN_ID, device)
+
+    # --- 2. Calculate DYNAMIC Buffer Size ---
+    current_len = input_ids.size(1)
+
+    # We only need space for the prompt + new tokens
+    batch_max_needed = current_len + max_new_tokens
+
+    # OPTIONAL: Round up to nearest 64 to reduce torch.compile recompilation frequency
+    batch_max_needed = (batch_max_needed + 127) // 128 * 128
+
+    # Clamp to model capacity
+    max_model_len = min(batch_max_needed, model.config.max_seq_len)
 
     # Pre-calculate 3D positions for prompt
     if cached_positions and all(p is not None for p in cached_positions):
@@ -169,9 +180,8 @@ def batched_greedy_generate(
     # We compile the forward pass specifically for the decoding step
     if not hasattr(model, "_compiled_decode"):
         print("Compiling model for decoding step...")
-        # Reduce-overhead works best with purely static shapes
         model._compiled_decode = torch.compile(
-            model.forward_generate, mode="reduce-overhead", fullgraph=True
+            model.forward_generate, mode="default", fullgraph=True
         )
 
     # --- 4. GENERATION LOOP ---
