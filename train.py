@@ -163,18 +163,31 @@ def train_one_epoch(
         ):
             splits = batch.get("splits")
             if splits:
-                mapping_cache: Dict[str, Optional[torch.Tensor]] = {}
-                for i, split in enumerate(splits):
-                    if split not in mapping_cache:
-                        mapping = color_augmentor.mapping_for_split(split)
-                        mapping_cache[split] = (
-                            mapping.to(device) if mapping is not None else None
-                        )
-                    mapping = mapping_cache[split]
-                    if mapping is None:
-                        continue
-                    seq_len = int(attention_mask[i].sum().item())
-                    input_ids[i, :seq_len] = mapping[input_ids[i, :seq_len]]
+                # Vectorized color augmentation
+                # 1. Retrieve the active augmentation map for this epoch (V,)
+                aug_map = color_augmentor.mappings[color_augmentor.current_index].to(
+                    device
+                )
+                vocab_size = aug_map.size(0)
+
+                # 2. Determine which examples in the batch should be augmented
+                # This creates a boolean mask (B, 1) to select maps
+                should_aug = torch.tensor(
+                    [
+                        (color_augmentor.mapping_for_split(s) is not None)
+                        for s in splits
+                    ],
+                    device=device,
+                ).reshape(-1, 1)
+
+                if should_aug.any():
+                    # 3. Construct batch maps (B, V) and gather
+                    # If augment: use aug_map; Else: use identity
+                    identity = torch.arange(vocab_size, device=device)
+                    batch_maps = torch.where(should_aug, aug_map, identity)
+
+                    # Apply map to all tokens: input_ids[b, t] = batch_maps[b, input_ids[b, t]]
+                    input_ids = torch.gather(batch_maps, 1, input_ids)
 
         # (set_to_none is slightly faster)
         optimizer.zero_grad(set_to_none=True)
