@@ -692,8 +692,15 @@ def evaluate_model_on_dataset(
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     task_ids: Optional[Sequence[str]] = None,
+    include_targets: bool = True,
 ) -> Dict[str, Dict[str, object]]:
     evaluation: Dict[str, Dict[str, object]] = {}
+    # Determine if we should look for targets for this specific split
+    # Usually we want targets for 'train' (to debug) but maybe not for 'test' if doing blind submission
+    split_include_targets = include_targets
+
+    # If the dataset split itself doesn't have outputs (like test) and we forced include_targets=True,
+    # run_split_inference will look for solutions.json. If we forced False, it won't.
     for split in splits:
         split_results = run_split_inference(
             model=model,
@@ -703,7 +710,7 @@ def evaluate_model_on_dataset(
             batch_size=batch_size,
             max_new_tokens=max_new_tokens,
             log_prompts=log_prompts,
-            include_targets=True,
+            include_targets=split_include_targets,
             color_mappings=color_mappings,
             color_apply_fn=color_apply_fn,
             task_ids=task_ids,
