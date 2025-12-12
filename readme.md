@@ -1,7 +1,8 @@
-***In progress, I expect improvements till 30%***
+***Update: 20% right now***
+***(In progress, I expect improvements till 30%)***
 # 10% on ARC-1 for less than a dollar using a 1M transformer
 
-This already beats the pareto frontier btws
+This already beats the pareto frontier btw
 
 ## Self supervised compression on ARC
 
