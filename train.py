@@ -665,15 +665,3 @@ def train_model(
         rng_state=rng_state,
         scheduler=scheduler,
     )
-
-
-if __name__ == "__main__":
-    import sys
-
-    # Alias this module when executed as a script so cli.py can import it without
-    # triggering a second load under the "train" name.
-    sys.modules.setdefault("train", sys.modules[__name__])
-
-    from cli import main
-
-    main()
