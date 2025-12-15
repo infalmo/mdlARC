@@ -163,15 +163,16 @@ def train_one_epoch(
         ):
             splits = batch.get("splits")
             if splits:
-                # Vectorized color augmentation
-                # 1. Retrieve the active augmentation map for this epoch (V,)
-                aug_map = color_augmentor.mappings[color_augmentor.current_index].to(
+                # 1. Prepare all available mappings on device (Do this once effectively)
+                # In a real optimization, move this line outside the "for batch" loop
+                all_maps = torch.stack(color_augmentor.mappings).to(
                     device
-                )
-                vocab_size = aug_map.size(0)
+                )  # Shape: (Num_Perms, Vocab)
+                vocab_size = all_maps.size(1)
+                bs = input_ids.size(0)
 
-                # 2. Determine which examples in the batch should be augmented
-                # This creates a boolean mask (B, 1) to select maps
+                # 2. Determine who needs augmentation
+                # Mask: (B, 1)
                 should_aug = torch.tensor(
                     [
                         (color_augmentor.mapping_for_split(s) is not None)
@@ -181,12 +182,29 @@ def train_one_epoch(
                 ).reshape(-1, 1)
 
                 if should_aug.any():
-                    # 3. Construct batch maps (B, V) and gather
-                    # If augment: use aug_map; Else: use identity
-                    identity = torch.arange(vocab_size, device=device)
-                    batch_maps = torch.where(should_aug, aug_map, identity)
+                    # 3. Pick random permutation indices for every example in the batch
+                    # Shape: (B,)
+                    rand_indices = torch.randint(
+                        0, all_maps.size(0), (bs,), device=device
+                    )
 
-                    # Apply map to all tokens: input_ids[b, t] = batch_maps[b, input_ids[b, t]]
+                    # 4. Gather the specific map for each example
+                    # Shape: (B, Vocab)
+                    chosen_maps = all_maps[rand_indices]
+
+                    # 5. Handle Identity cases (where should_aug is False)
+                    identity = (
+                        torch.arange(vocab_size, device=device)
+                        .unsqueeze(0)
+                        .expand(bs, -1)
+                    )
+
+                    # Final Map: (B, Vocab)
+                    # If should_aug[i] is True, use chosen_maps[i], else use identity[i]
+                    batch_maps = torch.where(should_aug, chosen_maps, identity)
+
+                    # 6. Apply map to all tokens
+                    # input_ids[b, t] = batch_maps[b, input_ids[b, t]]
                     input_ids = torch.gather(batch_maps, 1, input_ids)
 
         # (set_to_none is slightly faster)
