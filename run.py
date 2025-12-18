@@ -104,7 +104,7 @@ def build_config():
         "seed": 42,
         # Model Architecture
         "d_model": 1024,  # 128, 256, 512, 768 | 128, 384, 640
-        "n_heads": 12,  # 4, 8, 8/16, 12 | 4, 12, 10
+        "n_heads": 16,  # 4, 8, 8/16, 12 | 4, 12, 10
         "d_ff": 4096,  # 512, 1024, 2048, 3072 | 512, 1536, 2560
         "n_layers": 6,  # 4, 6, 16, 16 | 24, 28, 24
         # Loss masking
@@ -654,14 +654,12 @@ def modal_add_dep(img: modal.Image, local, remote, sync=False):
         img = img.add_local_file(f"{local}/{d}", f"{remote}/{d}", copy=True)
     if sync:
         img = img.run_commands(f"cd {remote} && uv sync")
-    return img.add_local_dir(local, remote, ignore=["*.venv"], copy=True)
+    return img.add_local_dir(local, remote, ignore=["*.venv", ".git"], copy=True)
 
 
 img = modal.Image.debian_slim()
 img = modal_add_dep(img, ".", ".", sync=True)
-vol = {
-    "/mnt/mdlarc-runs": modal.Volume.from_name("mdlarc-runs"),  # For saving run outputs
-}
+vol = {"/mnt/mdlarc-runs": modal.Volume.from_name("mdlarc-runs")}
 app = modal.App("arc-agi", image=img, volumes=vol, include_source=False)
 
 
