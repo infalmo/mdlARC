@@ -671,7 +671,7 @@ vol = {"/mnt/mdlarc-runs": modal.Volume.from_name("mdlarc-runs")}
 app = modal.App("arc-agi", image=img, volumes=vol, include_source=False)
 
 
-@app.function(gpu="H100")
+@app.function(gpu="H100", timeout=60 * 60 * 3)  # 3 hr timeout
 def main_modal():
     main()
 
