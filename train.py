@@ -614,14 +614,26 @@ def train_model(
 
     color_augmentor = getattr(dataloader, "color_augmentor", None)
 
+    # Retrieve cooldown parameter (default to 0 if not set)
+    cooldown_epochs = getattr(args, "color_aug_cooldown_epochs", 0)
+
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         if color_augmentor is not None and color_augmentor.num_permutations > 0:
             color_augmentor.set_index(epoch)
-            print(
-                f"Using color permutation {color_augmentor.current_index + 1}"
-                f"/{color_augmentor.num_permutations} for this epoch."
-            )
+            # Check if we are in the cooldown period
+            if (args.epochs - epoch) <= cooldown_epochs:
+                # Force Identity (Index 0 is always Identity)
+                color_augmentor.set_index(0)
+                print(
+                    f"Color Aug Cooldown: Forced identity color mapping for the final {cooldown_epochs} epochs."
+                )
+            else:
+                color_augmentor.set_index(epoch)
+                print(
+                    f"Using color permutation {color_augmentor.current_index + 1}"
+                    f"/{color_augmentor.num_permutations} for this epoch."
+                )
 
         # Run Training
         step = train_one_epoch(

@@ -1,0 +1,1 @@
+color_augmentor = getattr(dataloader, "color_augmentor", None)
