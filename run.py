@@ -195,9 +195,10 @@ def save_checkpoint(cfg, root_folder, mount_folder):
     # save data immediately in case eval fails
 
     # Reusable paths (keep these for cell 2)
-    SRC_DIR = Path(f"{root_folder}/runs") if root_folder != "." else Path("runs")
+    # Use mount_folder for SRC_DIR since runs are saved there on Modal
+    SRC_DIR = Path(f"{mount_folder}/runs") if mount_folder != "." else Path("runs")
     ZIP_BASE = (
-        Path(f"{root_folder}") if root_folder != "." else Path(".")
+        Path(f"{mount_folder}") if mount_folder != "." else Path(".")
     ) / f"runs-{cfg.name}"  # no .zip here
     LOCAL_ZIP = ZIP_BASE.with_suffix(".zip")
     MOUNT_DIR = Path(f"{mount_folder}") if mount_folder != "." else Path(".")
@@ -274,10 +275,12 @@ def run_evaluation_pipeline(
         model.eval()
         # Rebuild only dataset/loader
         _, dataset, dataloader, device, _ = train.build_model_and_data(
-            cfg, checkpoint=checkpoint
+            cfg, checkpoint=checkpoint, is_eval=True
         )
     else:
-        model, dataset, dataloader, device, _ = train.build_model_and_data(cfg)
+        model, dataset, dataloader, device, _ = train.build_model_and_data(
+            cfg, is_eval=True
+        )
 
     # 4. Run Inference (Logic from old Cell 3)
     def log_eval(msg):
@@ -503,9 +506,10 @@ def run_all_evaluations(cfg, args, device):
 
 def save_final_results(cfg, root_folder, mount_folder, last_drive_zip=None):
     """Save final results after evaluation."""
-    SRC_DIR = Path(f"{root_folder}/runs") if root_folder != "." else Path("runs")
+    # Use mount_folder for SRC_DIR since runs are saved there on Modal
+    SRC_DIR = Path(f"{mount_folder}/runs") if mount_folder != "." else Path("runs")
     ZIP_BASE = (
-        Path(f"{root_folder}") if root_folder != "." else Path(".")
+        Path(f"{mount_folder}") if mount_folder != "." else Path(".")
     ) / f"runs-{cfg.name}"
     LOCAL_ZIP = ZIP_BASE.with_suffix(".zip")
     MOUNT_DIR = Path(f"{mount_folder}") if mount_folder != "." else Path(".")
