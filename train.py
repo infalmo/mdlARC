@@ -152,10 +152,10 @@ def train_one_epoch(
     for batch in dataloader:
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        example_ids = batch["example_ids"].to(device, non_blocking=True)
-        positions_3d = batch["positions_3d"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
         if (
             color_augmentor is not None
             and not color_aug_in_collate
@@ -205,6 +205,7 @@ def train_one_epoch(
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
+        optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -474,7 +475,7 @@ def build_model_and_data(
     return model, dataset, dataloader, device, data_path
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def validate_one_epoch(
     model: TinyTransformer,
     dataloader: torch.utils.data.DataLoader,
@@ -485,29 +486,23 @@ def validate_one_epoch(
     total_loss_sum = 0.0
     total_tokens = 0
 
-    # Enable BF16 autocast for faster validation on CUDA (same as training)
-    use_amp = device.type == "cuda"
-
     for batch in dataloader:
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        example_ids = batch["example_ids"].to(device, non_blocking=True)
-        positions_3d = batch["positions_3d"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
 
         # We only care about validation on examples that actually have outputs
         # (The val_dataset should be constructed such that has_output is True)
         if not any(batch["has_output"]):
             continue
 
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
-        ):
-            outputs = model(
-                input_ids,
-                example_ids,
-                attention_mask=attention_mask,
-                positions_3d=positions_3d,
-            )
+        outputs = model(
+            input_ids,
+            example_ids,
+            attention_mask=attention_mask,
+            positions_3d=positions_3d,
+        )
 
         # 'output_loss' is the specific loss on tokens AFTER the separator
         out_loss = outputs.get("output_loss")
