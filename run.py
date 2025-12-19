@@ -111,7 +111,7 @@ def build_config():
         "d_ff": 3072,  # 512, 1024, 2048, 3072 | 512, 1536, 2560
         "n_layers": 4,  # 4, 6, 16, 16 | 24, 28, 24
         # Loss masking
-        "mask_input_loss": True,  # If True, only compute loss on output tokens (mask input loss)
+        "mask_input_loss": False,  # If True, only compute loss on output tokens (mask input loss)
         # Visibility toggles
         "log_train_strings": False,
         "log_train_limit": 10,

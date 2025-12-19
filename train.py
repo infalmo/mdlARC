@@ -389,9 +389,12 @@ def build_model_and_data(
         print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
         dataset = reuse_dataset
     else:
+        # During training (is_eval=False), only use train splits to avoid leaking test data
+        # During evaluation (is_eval=True), include both splits
+        dataset_splits = ("train", "test") if is_eval else ("train",)
         dataset = ARCExampleDataset(
             json_path=data_path,
-            splits=("train", "test"),
+            splits=dataset_splits,
             include_outputs=True,
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,
