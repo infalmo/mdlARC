@@ -1030,6 +1030,7 @@ def create_dataloader(
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
     color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
+    pin_memory: bool = True,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
@@ -1044,9 +1045,14 @@ def create_dataloader(
         if color_mapper is not None
         else collate_examples
     )
+    # pin_memory speeds up CPU->GPU transfers when using CUDA
+    # Only enable if CUDA is available to avoid warnings on CPU-only systems
+    use_pin_memory = pin_memory and torch.cuda.is_available()
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
+        pin_memory=use_pin_memory,
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
     )
