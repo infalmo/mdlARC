@@ -30,6 +30,7 @@ This will work on smaller GPUs too, but will take longer to train
 For very constrained environments, disable the "do_validate" flag. This avoids checking the validation loss every epoch
 """
 
+import os
 from pathlib import Path
 import argparse
 import importlib
@@ -49,9 +50,11 @@ import train
 import inference
 
 
+now = datetime.now().strftime("%m/%d-%H:%M")  # e.g., "20/12-12:22"
 # root_folder, mount_folder = "content", "content/drive/MyDrive"  # for colab
 # root_folder, mount_folder = ".", "."  # for local
-root_folder, mount_folder = "/app", "/mnt/mdlarc-runs"  # for modal
+root_folder, mount_folder = "/app", f"/out/{now}"  # for modal
+os.makedirs(mount_folder, exist_ok=False)
 
 
 # Helper class for logging to file and console
